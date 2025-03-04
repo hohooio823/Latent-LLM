@@ -608,37 +608,6 @@ class LatentPromptTransformer(nn.Module):
 
         return logits
 
-    # Determistic optimization. Paired with _adam in the posterior optimizer.
-    def log_posterior(
-        self,
-        tokens: torch.Tensor,
-        z: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-        h_before_cross_attention: Optional[torch.Tensor] = None,
-        reduce: bool = True, # whether to sum the loss
-    ) -> torch.Tensor:
-
-        h, h_before_cross_attention = self.decoder_forward_with_hidden(tokens, z, targets, h_before_cross_attention)
-
-        if reduce:
-            if targets is not None:
-                # if we are given some desired targets also calculate the loss
-                logits = self.output(h)
-                nlkhd = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction="sum"
-                )          
-            prior = -0.5 * z.pow(2).sum()
-            neg_log_posterior = nlkhd - prior
-        else:
-            logits = self.output(h)
-            nlkhd = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction="none"
-                )      
-            nlkhd = nlkhd.view(_bsz, -1).sum(dim=-1)
-            prior = -0.5 * z.pow(2).sum(dim=[-1, -2])
-            neg_log_posterior = nlkhd - prior
-        return neg_log_posterior, h_before_cross_attention
-
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
