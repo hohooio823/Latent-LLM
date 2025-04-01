@@ -1,1 +1,0 @@
-python zero_shot_sampling_qa.py

@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Import configuration
 import config
-from model_cl import LatentThoughtModel, LTMConfig
+from model import LatentThoughtModel, LTMConfig
 from optimizer import PosteriorOptimizer
 from owt import Task
 
