@@ -323,7 +323,7 @@ class LatentThoughtModel(nn.Module):
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
         self.layers = torch.nn.ModuleList()
-        # add latent prompt z at all layers or just the last layer
+        # add latent z at all layers or just the last layer
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params, use_cross_attention=True))
 

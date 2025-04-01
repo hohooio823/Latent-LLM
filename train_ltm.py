@@ -1,5 +1,5 @@
 """
-Main training script for Latent Prompt Transformer.
+Main training script for Latent Thought Language Model
 """
 import math
 import os
