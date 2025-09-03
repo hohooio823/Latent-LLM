@@ -56,6 +56,16 @@ max_z_len = n_layers * 8  # Maximum length of latent sequence
 z_dim = dim  # Dimension of latent variables
 
 # -----------------------------------------------------------------------------
+# SimCSE configuration
+# -----------------------------------------------------------------------------
+use_simcse = True  # Whether to use SimCSE contrastive learning
+simcse_pooler_type = "cls"  # Pooling strategy: cls, cls_before_pooler, avg, avg_top2, avg_first_last
+simcse_temperature = 0.05  # Temperature for softmax in contrastive loss
+simcse_projection_dim = 256  # Dimension of projection head
+simcse_use_projection_head = True  # Whether to use projection head
+simcse_weight = 0.1  # Weight for SimCSE loss in total loss
+
+# -----------------------------------------------------------------------------
 # Optimizer settings
 # -----------------------------------------------------------------------------
 gradient_accumulation_steps = 8  # Number of steps to accumulate gradients (simulates larger batch)

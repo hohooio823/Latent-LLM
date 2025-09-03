@@ -15,6 +15,7 @@ import config
 from model import LatentThoughtModel, LTMConfig
 from optimizer import PosteriorOptimizer
 from owt import Task
+from simcse_integration import create_simcse_integration, SentenceSimilarityEvaluator
 
 def main():
     """Main training function."""
@@ -215,24 +216,40 @@ def main():
     
     # Initialize posterior optimizers for training and evaluation
     posterior_optimizer = PosteriorOptimizer(
-        model=raw_model, 
-        inference_method=config.inference_method, 
-        num_steps=config.num_steps, 
-        max_z_len=config.max_z_len, 
-        z_dim=config.z_dim, 
-        lr=config.fast_lr, 
+        model=raw_model,
+        inference_method=config.inference_method,
+        num_steps=config.num_steps,
+        max_z_len=config.max_z_len,
+        z_dim=config.z_dim,
+        lr=config.fast_lr,
         eval_mode=False
     )
     
     posterior_optimizer_test = PosteriorOptimizer(
-        model=raw_model, 
-        inference_method=config.inference_method, 
-        num_steps=config.num_steps, 
-        max_z_len=config.max_z_len, 
-        z_dim=config.z_dim, 
-        lr=config.fast_lr, 
+        model=raw_model,
+        inference_method=config.inference_method,
+        num_steps=config.num_steps,
+        max_z_len=config.max_z_len,
+        z_dim=config.z_dim,
+        lr=config.fast_lr,
         eval_mode=True
     )
+    
+    # Initialize SimCSE integration if enabled
+    simcse_module = None
+    simcse_evaluator = None
+    if config.use_simcse:
+        print("Initializing SimCSE integration...")
+        simcse_config = {
+            'pooler_type': config.simcse_pooler_type,
+            'temperature': config.simcse_temperature,
+            'projection_dim': config.simcse_projection_dim,
+            'use_projection_head': config.simcse_use_projection_head,
+            'simcse_weight': config.simcse_weight
+        }
+        simcse_module = create_simcse_integration(raw_model, simcse_config)
+        simcse_evaluator = SentenceSimilarityEvaluator(simcse_module)
+        print("SimCSE integration initialized successfully.")
     
     # -----------------------------------------------------------------------------
     # Training Utilities
@@ -245,6 +262,7 @@ def main():
         loss_out = {}
         ppl_out = {}
         kl_out = {}
+        simcse_loss_out = {}
     
         model.eval()  # Set model to evaluation mode
         for split in ["val"]:
@@ -252,6 +270,7 @@ def main():
             losses = torch.zeros(config.eval_iters)  # Track losses over evaluation iterations
             ppl_list = torch.zeros(config.eval_iters)  # Track perplexities
             kl_list = torch.zeros(config.eval_iters)  # Track KL divergences
+            simcse_losses = torch.zeros(config.eval_iters) if config.use_simcse else None
             
             for k in range(config.eval_iters):
                 # Get next batch
@@ -259,35 +278,58 @@ def main():
                 
                 # Optimize latent variables for this batch
                 Z, ppl, kl_avg, nlkhd = posterior_optimizer_test.step(
-                    data=[X, Y, Z], 
-                    ctx=ctx, 
-                    scaler=scaler, 
-                    steps=config.num_steps, 
+                    data=[X, Y, Z],
+                    ctx=ctx,
+                    scaler=scaler,
+                    steps=config.num_steps,
                     lr=lr
                 )
                 
                 # Forward pass with optimized latents
                 with ctx:
-                    logits = model(X, Z, Y)
-                    loss = raw_model.last_loss
+                    if config.use_simcse and simcse_module is not None:
+                        # Use SimCSE module for forward pass
+                        results = simcse_module(
+                            X, torch.ones_like(X).bool(), Y,
+                            compute_contrastive=False
+                        )
+                        loss = results['loss']
+                    else:
+                        logits = model(X, Z, Y)
+                        loss = raw_model.last_loss
                 
                 # Record metrics
                 losses[k] = loss.item()
                 ppl_list[k] = ppl.item()
                 kl_list[k] = kl_avg.item()
                 
+                if config.use_simcse and simcse_losses is not None:
+                    # Compute SimCSE loss on validation data
+                    with torch.no_grad():
+                        # Create a second batch for contrastive learning
+                        X2, Y2, Z2 = next(batch_iter)
+                        simcse_result = simcse_module(
+                            X, torch.ones_like(X).bool(), Y,
+                            compute_contrastive=True,
+                            contrastive_batch={'input_ids': X2, 'attention_mask': torch.ones_like(X2).bool()}
+                        )
+                        simcse_losses[k] = simcse_result['contrastive_loss'].item()
+                
                 # Clean up to avoid OOM issues
                 del X, Y, Z, logits, loss, ppl, kl_avg, nlkhd
-                torch.cuda.empty_cache() 
+                torch.cuda.empty_cache()
                 
             # Compute average metrics
             loss_out[split] = losses.mean()
             ppl_out[split] = ppl_list.mean()
             kl_out[split] = kl_list.mean()
+            
+            if config.use_simcse and simcse_losses is not None:
+                simcse_loss_out[split] = simcse_losses.mean()
         
         model.train()  # Set model back to training mode
         torch.cuda.empty_cache()
-        return loss_out, ppl_out, kl_out
+        return loss_out, ppl_out, kl_out, simcse_loss_out if config.use_simcse else None
     
     def get_lr(it):
         """
@@ -338,8 +380,10 @@ def main():
         
         # Evaluate model and save checkpoint periodically
         if iter_num % config.eval_interval == 0 and master_process:
-            losses, ppl_out, kl_out = estimate_loss(current_lr)
+            losses, ppl_out, kl_out, simcse_losses = estimate_loss(current_lr)
             print(f"Step {iter_num}: val loss {losses['val']:.4f}, val PPL {ppl_out['val']:.4f}, val KL {kl_out['val']:.4f}")
+            if config.use_simcse and simcse_losses is not None:
+                print(f"Step {iter_num}: SimCSE val loss {simcse_losses['val']:.4f}")
     
             # Save checkpoint if validation loss improved or if always_save_checkpoint is True
             if losses["val"] < best_val_loss or config.always_save_checkpoint:
@@ -379,9 +423,18 @@ def main():
             
             # Forward pass with optimized latents
             with ctx:
-                logits = model(X, Z, Y)
-                loss = raw_model.last_loss
-                loss = loss / gradient_accumulation_steps  # Scale loss for gradient accumulation
+                if config.use_simcse and simcse_module is not None:
+                    # Use SimCSE module for forward pass with contrastive learning
+                    results = simcse_module(
+                        X, torch.ones_like(X).bool(), Y,
+                        compute_contrastive=True,
+                        contrastive_batch={'input_ids': X, 'attention_mask': torch.ones_like(X).bool()}
+                    )
+                    loss = results['total_loss'] / gradient_accumulation_steps  # Scale loss for gradient accumulation
+                else:
+                    logits = model(X, Z, Y)
+                    loss = raw_model.last_loss
+                    loss = loss / gradient_accumulation_steps  # Scale loss for gradient accumulation
                     
             # Prefetch next batch asynchronously while GPU is busy
             X, Y, Z = next(train_batch_iter)
