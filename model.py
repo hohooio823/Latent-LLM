@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from liger_module import LigerRMSNorm, LigerSwiGLUMLP, liger_rotary_pos_emb, LigerCrossEntropyLoss, LigerLayerNorm
+from rwkv_block import RWKVBlock, RWKV8Block
 
 @dataclass
 class LTMConfig:
@@ -17,7 +18,7 @@ class LTMConfig:
     n_kv_heads: Optional[int] = None
     vocab_size: int = 32000
     hidden_dim: Optional[int] = None
-    multiple_of: int = 256  
+    multiple_of: int = 256
     norm_eps: float = 1e-5
     max_seq_len: int = 1024
     dropout: float = 0.0
@@ -27,7 +28,13 @@ class LTMConfig:
     use_liger: bool = True
     max_z_len: int = 32
     use_z_pos_emb: bool = True
-    padding: bool = False 
+    padding: bool = False
+    
+    # RWKV-specific parameters
+    use_rwkv: bool = True  # Whether to use RWKV instead of transformer
+    use_rwkv8_ffn: bool = True  # Whether to use RWKV-8 feed-forward network
+    head_size: int = 64  # RWKV head size
+    rwkv_mode: str = "rwkv8"  # RWKV mode: "rwkv7" or "rwkv8"
 
 
 class RMSNorm(torch.nn.Module):
@@ -325,7 +332,16 @@ class LatentThoughtModel(nn.Module):
         self.layers = torch.nn.ModuleList()
         # add latent z at all layers or just the last layer
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params, use_cross_attention=True))
+            if params.use_rwkv:
+                # Use RWKV blocks
+                if params.rwkv_mode == "rwkv8":
+                    self.layers.append(RWKV8Block(layer_id, params, use_cross_attention=True))
+                else:
+                    self.layers.append(RWKVBlock(layer_id, params, use_cross_attention=True,
+                                               use_rwkv8_ffn=params.use_rwkv8_ffn))
+            else:
+                # Use original transformer blocks
+                self.layers.append(TransformerBlock(layer_id, params, use_cross_attention=True))
 
         self.use_liger = params.use_liger
         if params.use_liger: 

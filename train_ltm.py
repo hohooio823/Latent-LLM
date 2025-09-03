@@ -125,6 +125,10 @@ def main():
         use_liger=True,  # Enable LIGER (Learned Implicit Generator) mode
         max_z_len=config.max_z_len,
         use_z_pos_emb=True,  # Use positional embeddings for latent variables
+        use_rwkv=config.use_rwkv,  # Use RWKV instead of transformer
+        use_rwkv8_ffn=config.use_rwkv8_ffn,  # Use RWKV-8 feed-forward network
+        head_size=config.head_size,  # RWKV head size
+        rwkv_mode=config.rwkv_mode,  # RWKV mode: "rwkv7" or "rwkv8"
     )
     
     if config.init_from == "scratch":

@@ -36,6 +36,12 @@ multiple_of = 32  # Hidden dimension is rounded to a multiple of this value
 dropout = 0.0  # Dropout probability
 window_size = 256  # Context window size
 
+# RWKV configuration
+use_rwkv = True  # Whether to use RWKV instead of transformer
+use_rwkv8_ffn = True  # Whether to use RWKV-8 feed-forward network
+head_size = 64  # RWKV head size
+rwkv_mode = "rwkv8"  # RWKV mode: "rwkv7" or "rwkv8"
+
 # -----------------------------------------------------------------------------
 # Latent variable configuration
 # -----------------------------------------------------------------------------
