@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from liger_module import LigerRMSNorm, LigerSwiGLUMLP, liger_rotary_pos_emb, LigerCrossEntropyLoss, LigerLayerNorm
 from rwkv_block import RWKVBlock, RWKV8Block
+from dit_prior import DiTPrior, DiTConfig
 
 @dataclass
 class LTMConfig:
@@ -35,6 +36,17 @@ class LTMConfig:
     use_rwkv8_ffn: bool = True  # Whether to use RWKV-8 feed-forward network
     head_size: int = 64  # RWKV head size
     rwkv_mode: str = "rwkv8"  # RWKV mode: "rwkv7" or "rwkv8"
+    
+    # DiT prior parameters
+    use_dit_prior: bool = False  # Whether to use DiT prior instead of Gaussian prior
+    dit_layers: int = 12  # Number of layers in DiT prior
+    dit_heads: int = 12  # Number of heads in DiT prior
+    dit_dim: int = 768  # Hidden dimension in DiT prior
+    dit_multiple_of: int = 32  # Multiple of for DiT hidden dimension
+    dit_num_timesteps: int = 1000  # Number of diffusion timesteps
+    dit_beta_schedule: str = "linear"  # Beta schedule for diffusion
+    dit_beta_start: float = 0.0001  # Starting beta value
+    dit_beta_end: float = 0.02  # Ending beta value
 
 
 class RMSNorm(torch.nn.Module):
@@ -389,6 +401,29 @@ class LatentThoughtModel(nn.Module):
 
         # Initialize attribute for the loss of the last forward call
         self.last_loss = None
+        
+        # Initialize DiT prior if enabled
+        self.use_dit_prior = params.use_dit_prior
+        if self.use_dit_prior:
+            print("Initializing DiT prior...")
+            dit_config = DiTConfig(
+                z_dim=params.dim,
+                max_z_len=params.max_z_len // params.n_layers,  # Per-layer latent length
+                dit_layers=params.dit_layers,
+                dit_heads=params.dit_heads,
+                dit_dim=params.dit_dim,
+                dit_multiple_of=params.dit_multiple_of,
+                dropout=params.dropout,
+                num_timesteps=params.dit_num_timesteps,
+                beta_schedule=params.dit_beta_schedule,
+                beta_start=params.dit_beta_start,
+                beta_end=params.dit_beta_end,
+                use_liger=params.use_liger
+            )
+            self.dit_prior = DiTPrior(dit_config)
+            print(f"DiT prior initialized with {sum(p.numel() for p in self.dit_prior.parameters()):,} parameters")
+        else:
+            self.dit_prior = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -462,7 +497,8 @@ class LatentThoughtModel(nn.Module):
         h = self.norm(h)
         return h, h_before_cross_attention.detach()
 
-    def forward(self, tokens: torch.Tensor, z: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, z: torch.Tensor, targets: Optional[torch.Tensor] = None,
+                dit_timesteps: Optional[torch.Tensor] = None) -> torch.Tensor:
         h = self.decoder_forward(tokens, z, targets)
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -584,14 +620,20 @@ class LatentThoughtModel(nn.Module):
         targets: Optional[torch.Tensor] = None,
         h_before_cross_attention: Optional[torch.Tensor] = None,
         eval_mode: bool = False,  # Whether to compute perplexity
+        dit_timesteps: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
 
         _bsz, seqlen = tokens.shape
         weight = 1.0
 
         # Compute KL divergence
-        kl_div = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())  # -KL(q|p)
-        kl_loss = kl_div.sum(dim=(1, 2))  # Sum over latent dims, shape = (batch_size,)
+        if self.use_dit_prior and dit_timesteps is not None:
+            # Use DiT prior for KL computation
+            kl_loss = self.compute_dit_kl_loss(mu, log_var, dit_timesteps)
+        else:
+            # Use standard Gaussian prior
+            kl_div = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())  # -KL(q|p)
+            kl_loss = kl_div.sum(dim=(1, 2))  # Sum over latent dims, shape = (batch_size,)
 
         # sample z by reparametrization trick
         z = mu + eps * torch.exp(0.5 * log_var)
@@ -623,3 +665,76 @@ class LatentThoughtModel(nn.Module):
             nelbo_total = nlkhd_total + kl_loss_total * weight
             perplexity = None
             return nelbo_total, perplexity, h_before_cross_attention.detach() if h_before_cross_attention is not None else None, kl_loss_total, nlkhd_total
+    
+    def compute_dit_kl_loss(self, mu: torch.Tensor, log_var: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """Compute KL divergence using DiT prior."""
+        batch_size = mu.shape[0]
+        
+        # Reshape mu to match DiT input format
+        mu_reshaped = mu.view(batch_size, self.n_layers, -1, self.params.dim)
+        
+        # Get DiT prior predictions
+        with torch.no_grad():
+            # Use DiT to predict noise for the given timesteps
+            noise_pred = self.dit_prior(mu_reshaped, timesteps)
+        
+        # Simple KL approximation using the difference between predicted and actual noise
+        # This is a simplified approach - in practice, you might want a more sophisticated KL computation
+        std = torch.exp(0.5 * log_var)
+        actual_noise = torch.randn_like(mu) * std
+        
+        # Compute MSE between predicted and actual noise as a proxy for KL
+        kl_approx = F.mse_loss(noise_pred, actual_noise, reduction='sum')
+        
+        return kl_approx
+    
+    def sample_from_prior(self, batch_size: int, device: torch.device,
+                         num_steps: Optional[int] = None) -> torch.Tensor:
+        """Sample from the prior distribution (Gaussian or DiT)."""
+        if self.use_dit_prior:
+            # Sample from DiT prior
+            if num_steps is None:
+                num_steps = self.params.dit_num_timesteps
+            
+            # Generate random timesteps for sampling
+            timesteps = torch.randint(0, num_steps, (batch_size,), device=device)
+            
+            # Sample from DiT prior
+            z_shape = (batch_size, self.n_layers, self.max_z_len, self.params.dim)
+            z_sampled = self.dit_prior.sample(batch_size, device, z_shape)
+            
+            return z_sampled.view(batch_size, -1)
+        else:
+            # Sample from standard Gaussian prior
+            z_shape = (batch_size, self.max_z_len * self.n_layers * self.params.dim)
+            return torch.randn(z_shape, device=device)
+    
+    def encode_with_dit(self, z: torch.Tensor, num_steps: int = 50) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode latent vectors using DiT diffusion process."""
+        if not self.use_dit_prior:
+            raise ValueError("DiT prior is not enabled")
+        
+        batch_size = z.shape[0]
+        
+        # Reshape z to match DiT input format
+        z_reshaped = z.view(batch_size, self.n_layers, -1, self.params.dim)
+        
+        # Encode using DiT
+        z_noisy, timesteps, noise = self.dit_prior.encode(z_reshaped)
+        
+        return z_noisy.view(batch_size, -1), timesteps
+    
+    def decode_with_dit(self, z: torch.Tensor, num_steps: int = 50) -> torch.Tensor:
+        """Decode latent vectors using DiT denoising process."""
+        if not self.use_dit_prior:
+            raise ValueError("DiT prior is not enabled")
+        
+        batch_size = z.shape[0]
+        
+        # Reshape z to match DiT input format
+        z_reshaped = z.view(batch_size, self.n_layers, -1, self.params.dim)
+        
+        # Decode using DiT
+        z_denoised = self.dit_prior.decode(z_reshaped, num_steps)
+        
+        return z_denoised.view(batch_size, -1)

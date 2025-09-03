@@ -55,6 +55,17 @@ n_cls_tokens = 0  # Number of classification tokens
 max_z_len = n_layers * 8  # Maximum length of latent sequence
 z_dim = dim  # Dimension of latent variables
 
+# DiT prior configuration
+use_dit_prior = True  # Whether to use DiT prior instead of Gaussian prior
+dit_layers = 6  # Number of layers in DiT prior (reduced for efficiency)
+dit_heads = 8  # Number of heads in DiT prior
+dit_dim = 512  # Hidden dimension in DiT prior (reduced for efficiency)
+dit_multiple_of = 32  # Multiple of for DiT hidden dimension
+dit_num_timesteps = 1000  # Number of diffusion timesteps
+dit_beta_schedule = "linear"  # Beta schedule for diffusion
+dit_beta_start = 0.0001  # Starting beta value
+dit_beta_end = 0.02  # Ending beta value
+
 # -----------------------------------------------------------------------------
 # SimCSE configuration
 # -----------------------------------------------------------------------------

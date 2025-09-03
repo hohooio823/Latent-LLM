@@ -16,6 +16,7 @@ class PosteriorOptimizer:
         self.model = model
         self.inference_method = inference_method
         self.kwargs = kwargs
+        self.use_dit_prior = kwargs.get("use_dit_prior", False)
         print("Optimizer kwargs", self.kwargs)
 
     def step(self, data: List, ctx, scaler: Optional[torch.cuda.amp.GradScaler] = None, 
@@ -96,6 +97,12 @@ class PosteriorOptimizer:
 
             mu = mu.view(_bsz, max_z_len, z_dim)
             log_var = log_var.view(_bsz, max_z_len, z_dim)
+            
+            # Generate DiT timesteps if using DiT prior
+            if self.use_dit_prior:
+                timesteps = torch.randint(0, self.model.dit_prior.config.num_timesteps, (_bsz,), device=X.device)
+            else:
+                timesteps = None
 
         # Set up parameters for optimization
         mu.requires_grad_()
@@ -116,7 +123,7 @@ class PosteriorOptimizer:
                 
             optimizer.zero_grad(set_to_none=True)  # More memory-efficient than False
             with ctx:
-                loss, _, h, _, _ = self.model.elbo(X, mu, log_var, e, Y, h, eval_mode=eval_mode)
+                loss, _, h, _, _ = self.model.elbo(X, mu, log_var, e, Y, h, eval_mode=eval_mode, dit_timesteps=timesteps)
         
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -142,7 +149,7 @@ class PosteriorOptimizer:
 
         # Compute final metrics
         with ctx:
-            loss, ppl, h, kl_loss, nlkhd = self.model.elbo(X, mu, log_var, e, Y, h, eval_mode=True)
+            loss, ppl, h, kl_loss, nlkhd = self.model.elbo(X, mu, log_var, e, Y, h, eval_mode=True, dit_timesteps=timesteps)
 
         # Return optimized latent variables and metrics
         return z.detach(), ppl.detach(), kl_loss.detach(), nlkhd.detach()
