@@ -27,7 +27,7 @@ DATASET_NUM_SAMPLES = None  # Number of samples to download (None for all)
 DATASET_TOKENIZER = "gpt2"  # Tokenizer to use for preprocessing
 DATASET_NUM_WORKERS = 4  # Number of workers for parallel processing
 batch_size = 64  # Micro-batch size (before gradient accumulation)
-max_seq_len = 4096  # Maximum sequence length (context window)
+max_seq_len = 1024  # Maximum sequence length (context window)
 vocab_size = 50258  # Vocabulary size
 
 # -----------------------------------------------------------------------------
