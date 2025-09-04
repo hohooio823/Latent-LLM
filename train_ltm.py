@@ -7,6 +7,7 @@ import time
 from contextlib import nullcontext
 from functools import partial
 import torch
+import torch.nn.functional as F
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -17,8 +18,37 @@ from optimizer import PosteriorOptimizer
 from owt import Task
 from simcse_integration import create_simcse_integration, SentenceSimilarityEvaluator
 
+# Memory optimization utilities
+def optimize_memory_usage():
+    """Optimize PyTorch memory usage"""
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+def enable_tf32():
+    """Enable TF32 precision for better performance on Ampere+ GPUs"""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+def enable_flash_attention():
+    """Enable Flash Attention if available"""
+    if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+        print("Flash Attention is available and will be used")
+        return True
+    else:
+        print("Flash Attention not available, using standard attention")
+        return False
+
 def main():
     """Main training function."""
+    
+    # -----------------------------------------------------------------------------
+    # Memory Optimization Setup
+    # -----------------------------------------------------------------------------
+    # Apply memory optimizations at the start
+    optimize_memory_usage()
+    enable_tf32()
+    enable_flash_attention()
     
     # -----------------------------------------------------------------------------
     # Distributed Training Setup
@@ -75,6 +105,13 @@ def main():
     # Enable TF32 precision for better performance on Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    
+    # Apply memory optimizations
+    if config.memory_optimization:
+        torch.cuda.empty_cache()
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        print("Memory optimizations applied")
     
     # Device and precision setup
     device_type = "cuda" if "cuda" in device else "cpu"
@@ -324,7 +361,8 @@ def main():
                 del X, Y, Z, loss, ppl, kl_avg, nlkhd
                 if 'logits' in locals():
                     del logits
-                torch.cuda.empty_cache()
+                if config.memory_optimization:
+                    torch.cuda.empty_cache()
                 
             # Compute average metrics
             loss_out[split] = losses.mean()
@@ -472,6 +510,10 @@ def main():
         
         # Clear gradients to free memory
         optimizer.zero_grad(set_to_none=True)
+        
+        # Apply memory optimization periodically
+        if iter_num % 100 == 0 and config.memory_optimization:
+            torch.cuda.empty_cache()
     
         # -----------------------------------------------------------------------------
         # Logging and Timing

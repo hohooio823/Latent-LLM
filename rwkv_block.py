@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from typing import Optional
+
 # Conditional import: optimized vs baseline attention
 try:
     from config import use_optimized_rwkv as _use_opt_rwkv  # bool
@@ -19,7 +21,7 @@ class RWKVBlock(nn.Module):
     Combines RWKV attention and RWKV feed-forward network
     """
     
-    def __init__(self, layer_id: int, args, use_cross_attention: bool = False, 
+    def __init__(self, layer_id: int, args, use_cross_attention: bool = False,
                  use_full_attention: bool = False, use_rwkv8_ffn: bool = False):
         super().__init__()
         self.layer_id = layer_id
@@ -27,8 +29,11 @@ class RWKVBlock(nn.Module):
         self.use_cross_attention = use_cross_attention
         self.use_rwkv8_ffn = use_rwkv8_ffn
         
+        # Enable gradient checkpointing if configured
+        self.use_gradient_checkpointing = getattr(args, 'gradient_checkpointing', False)
+        
         # RWKV attention
-        self.attention = RWKVAttention(args, cross_attention=use_cross_attention, 
+        self.attention = RWKVAttention(args, cross_attention=use_cross_attention,
                                      full_attention=use_full_attention)
         
         # Cross attention if needed
@@ -63,19 +68,28 @@ class RWKVBlock(nn.Module):
                 freqs_cos_z: Optional[torch.Tensor] = None, freqs_sin_z: Optional[torch.Tensor] = None,
                 padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         
-        # Apply attention with layer normalization
-        h = x + self.dropout(self.attention.forward(
-            self.attention_norm(x), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
-        ))
-        
-        # Apply cross attention if needed
-        if self.use_cross_attention and z is not None:
-            h = h + self.dropout(self.cross_attention.forward(
-                self.cross_attention_norm(h), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
+        def _forward_block(x, freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask):
+            # Apply attention with layer normalization
+            h = x + self.dropout(self.attention.forward(
+                self.attention_norm(x), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
             ))
+            
+            # Apply cross attention if needed
+            if self.use_cross_attention and z is not None:
+                h = h + self.dropout(self.cross_attention.forward(
+                    self.cross_attention_norm(h), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
+                ))
+            
+            # Apply feed-forward network with layer normalization
+            out = h + self.dropout(self.feed_forward.forward(self.ffn_norm(h)))
+            
+            return out
         
-        # Apply feed-forward network with layer normalization
-        out = h + self.dropout(self.feed_forward.forward(self.ffn_norm(h)))
+        # Apply gradient checkpointing during training if enabled
+        if self.training and self.use_gradient_checkpointing:
+            out = checkpoint(_forward_block, x, freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask)
+        else:
+            out = _forward_block(x, freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask)
         
         return out
 
@@ -86,15 +100,18 @@ class RWKV8Block(nn.Module):
     Uses RWKV-7 attention and RWKV-8 feed-forward network
     """
     
-    def __init__(self, layer_id: int, args, use_cross_attention: bool = False, 
+    def __init__(self, layer_id: int, args, use_cross_attention: bool = False,
                  use_full_attention: bool = False):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
         self.use_cross_attention = use_cross_attention
         
+        # Enable gradient checkpointing if configured
+        self.use_gradient_checkpointing = getattr(args, 'gradient_checkpointing', False)
+        
         # RWKV-7 attention
-        self.attention = RWKVAttention(args, cross_attention=use_cross_attention, 
+        self.attention = RWKVAttention(args, cross_attention=use_cross_attention,
                                      full_attention=use_full_attention)
         
         # Cross attention if needed
@@ -129,22 +146,31 @@ class RWKV8Block(nn.Module):
                 freqs_cos_z: Optional[torch.Tensor] = None, freqs_sin_z: Optional[torch.Tensor] = None,
                 padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         
-        # Apply lambda mixing (as in RWKV-8)
-        x0 = x
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        
-        # Apply attention with layer normalization
-        h = x + self.dropout(self.attention.forward(
-            self.attention_norm(x), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
-        ))
-        
-        # Apply cross attention if needed
-        if self.use_cross_attention and z is not None:
-            h = h + self.dropout(self.cross_attention.forward(
-                self.cross_attention_norm(h), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
+        def _forward_block(x, freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask):
+            # Apply lambda mixing (as in RWKV-8)
+            x0 = x
+            x = self.lambdas[0] * x + self.lambdas[1] * x0
+            
+            # Apply attention with layer normalization
+            h = x + self.dropout(self.attention.forward(
+                self.attention_norm(x), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
             ))
+            
+            # Apply cross attention if needed
+            if self.use_cross_attention and z is not None:
+                h = h + self.dropout(self.cross_attention.forward(
+                    self.cross_attention_norm(h), freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask
+                ))
+            
+            # Apply feed-forward network with layer normalization
+            out = h + self.dropout(self.feed_forward.forward(self.ffn_norm(h)))
+            
+            return out
         
-        # Apply feed-forward network with layer normalization
-        out = h + self.dropout(self.feed_forward.forward(self.ffn_norm(h)))
+        # Apply gradient checkpointing during training if enabled
+        if self.training and self.use_gradient_checkpointing:
+            out = checkpoint(_forward_block, x, freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask)
+        else:
+            out = _forward_block(x, freqs_cos, freqs_sin, z, freqs_cos_z, freqs_sin_z, padding_mask)
         
         return out

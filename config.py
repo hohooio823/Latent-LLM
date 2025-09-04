@@ -116,6 +116,9 @@ def get_config_dict():
 # -----------------------------------------------------------------------------
 # OPTIMIZATION SETTINGS
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# OPTIMIZATION SETTINGS
+# -----------------------------------------------------------------------------
 # Enable multi-threaded data loading
 num_workers = 8  # Number of data loading workers (was 0)
 
@@ -149,3 +152,6 @@ dit_optimization_level = 1  # 0: none, 1: basic, 2: advanced
 # Memory optimization settings
 memory_efficient_attention = True  # Use memory efficient attention
 gradient_checkpointing_interval = 1  # Apply checkpointing every N layers
+
+# Enable torch.compile for performance
+compile = True  # Enable PyTorch 2.0 compilation
