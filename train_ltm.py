@@ -44,7 +44,7 @@ def main():
         device = f"cuda:{ddp_local_rank}"
         print(f"DDP setup complete. Using device: {device}")
         torch.cuda.set_device(device)
-        master_process = ddp_rank == 1  # Process responsible for logging and checkpoints
+        master_process = (ddp_rank == 0)  # Process responsible for logging and checkpoints
         seed_offset = ddp_rank  # Each process gets a different seed
         
         # Scale down gradient accumulation steps proportionally to world size
@@ -103,7 +103,7 @@ def main():
         max_z_len=config.max_z_len,
         z_dim=config.z_dim,
         device=device,
-        num_workers=0,
+        num_workers=config.num_workers,
     )
     
     # -----------------------------------------------------------------------------
@@ -130,6 +130,8 @@ def main():
         use_rwkv8_ffn=config.use_rwkv8_ffn,  # Use RWKV-8 feed-forward network
         head_size=config.head_size,  # RWKV head size
         rwkv_mode=config.rwkv_mode,  # RWKV mode: "rwkv7" or "rwkv8"
+        use_optimized_rwkv=config.use_optimized_rwkv,
+        gradient_checkpointing=config.gradient_checkpointing,
     )
     
     if config.init_from == "scratch":
@@ -199,9 +201,7 @@ def main():
     
     # Wrap model in DDP container for distributed training
     if ddp:
-        # Ignore the `freqs_cis` buffer for DDP broadcasting (NCCL doesn't support ComplexFloat)
-        prefix = "_orig_mod." if config.compile else ""
-        model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
+        # No special buffer ignores needed (freqs_cos/freqs_sin are floats)
         model = DDP(model, device_ids=[ddp_local_rank])
     
     # -----------------------------------------------------------------------------
@@ -221,6 +221,7 @@ def main():
         num_steps=config.num_steps,
         max_z_len=config.max_z_len,
         z_dim=config.z_dim,
+        use_dit_prior=config.use_dit_prior,
         lr=config.fast_lr,
         eval_mode=False
     )
@@ -231,6 +232,7 @@ def main():
         num_steps=config.num_steps,
         max_z_len=config.max_z_len,
         z_dim=config.z_dim,
+        use_dit_prior=config.use_dit_prior,
         lr=config.fast_lr,
         eval_mode=True
     )
@@ -291,6 +293,7 @@ def main():
                         # Use SimCSE module for forward pass
                         results = simcse_module(
                             X, torch.ones_like(X).bool(), Y,
+                            z=Z,
                             compute_contrastive=False
                         )
                         loss = results['loss']
@@ -310,13 +313,16 @@ def main():
                         X2, Y2, Z2 = next(batch_iter)
                         simcse_result = simcse_module(
                             X, torch.ones_like(X).bool(), Y,
+                            z=Z,
                             compute_contrastive=True,
-                            contrastive_batch={'input_ids': X2, 'attention_mask': torch.ones_like(X2).bool()}
+                            contrastive_batch={'input_ids': X2, 'attention_mask': torch.ones_like(X2).bool(), 'z': Z2}
                         )
                         simcse_losses[k] = simcse_result['contrastive_loss'].item()
                 
                 # Clean up to avoid OOM issues
-                del X, Y, Z, logits, loss, ppl, kl_avg, nlkhd
+                del X, Y, Z, loss, ppl, kl_avg, nlkhd
+                if 'logits' in locals():
+                    del logits
                 torch.cuda.empty_cache()
                 
             # Compute average metrics
@@ -424,20 +430,28 @@ def main():
             # Forward pass with optimized latents
             with ctx:
                 if config.use_simcse and simcse_module is not None:
-                    # Use SimCSE module for forward pass with contrastive learning
+                    # Fetch a second view for contrastive learning
+                    X2, Y2, Z2 = next(train_batch_iter)
+                    
                     results = simcse_module(
                         X, torch.ones_like(X).bool(), Y,
+                        z=Z,
                         compute_contrastive=True,
-                        contrastive_batch={'input_ids': X, 'attention_mask': torch.ones_like(X).bool()}
+                        contrastive_batch={'input_ids': X2,
+                                           'attention_mask': torch.ones_like(X2).bool(),
+                                           'z': Z2}
                     )
                     loss = results['total_loss'] / gradient_accumulation_steps  # Scale loss for gradient accumulation
+                    
+                    # Reuse X2,Y2,Z2 as next batch to avoid double dataloader step
+                    X, Y, Z = X2, Y2, Z2
                 else:
                     logits = model(X, Z, Y)
                     loss = raw_model.last_loss
                     loss = loss / gradient_accumulation_steps  # Scale loss for gradient accumulation
                     
-            # Prefetch next batch asynchronously while GPU is busy
-            X, Y, Z = next(train_batch_iter)
+                    # Prefetch next batch asynchronously while GPU is busy
+                    X, Y, Z = next(train_batch_iter)
             
             # Backward pass with gradient scaling for mixed precision
             scaler.scale(loss).backward()

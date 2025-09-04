@@ -157,7 +157,7 @@ def test_training_integration():
     # Test optimization step
     with torch.no_grad():
         data = [tokens, targets, None]
-        ctx = torch.no.no_grad()
+        ctx = torch.no_grad()
         
         z, ppl, kl_loss, nlkhd = optimizer.step(data, ctx)
         

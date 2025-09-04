@@ -70,7 +70,7 @@ dit_beta_end = 0.02  # Ending beta value
 # SimCSE configuration
 # -----------------------------------------------------------------------------
 use_simcse = True  # Whether to use SimCSE contrastive learning
-simcse_pooler_type = "cls"  # Pooling strategy: cls, cls_before_pooler, avg, avg_top2, avg_first_last
+simcse_pooler_type = "avg"  # Pooling strategy: cls, cls_before_pooler, avg, avg_top2, avg_first_last
 simcse_temperature = 0.05  # Temperature for softmax in contrastive loss
 simcse_projection_dim = 256  # Dimension of projection head
 simcse_use_projection_head = True  # Whether to use projection head
@@ -99,6 +99,8 @@ min_lr = 4e-5  # Minimum learning rate (typically learning_rate/10)
 device = "cuda"  # Device to use: 'cpu', 'cuda', 'cuda:0', etc.
 dtype = "bfloat16"  # Data type: float32, bfloat16, or float16
 compile = False  # Whether to use PyTorch 2.0 compilation for speed
+# Optimization flags
+gradient_checkpointing: bool = False
 
 # Create a dictionary of all configuration parameters
 def get_config_dict():
@@ -108,3 +110,40 @@ def get_config_dict():
             if not k.startswith("_") and 
                not callable(v) and 
                k not in ('os', 'datetime', 'timestamp')}
+
+# -----------------------------------------------------------------------------
+# OPTIMIZATION SETTINGS
+# -----------------------------------------------------------------------------
+# Enable multi-threaded data loading
+num_workers = 8  # Number of data loading workers (was 0)
+
+# Enable gradient checkpointing for memory efficiency
+gradient_checkpointing = True  # Enable gradient checkpointing
+
+# Enable optimized RWKV processing
+use_optimized_rwkv = True  # Use optimized RWKV attention
+
+# Enable Flash Attention if available
+use_flash_attention = True  # Use Flash Attention kernels
+
+# Enable memory optimization
+memory_optimization = True  # Enable memory optimization features
+
+# Enable KV caching for generation
+use_kv_cache = True  # Use KV cache for faster generation
+
+# Enable efficient DiT sampling
+use_efficient_dit_sampling = True  # Use efficient DiT sampling
+
+# Enable model quantization
+use_quantization = False  # Enable model quantization (disabled by default)
+
+# RWKV optimization settings
+rwkv_optimization_level = 2  # 0: none, 1: basic, 2: advanced
+
+# DiT optimization settings
+dit_optimization_level = 1  # 0: none, 1: basic, 2: advanced
+
+# Memory optimization settings
+memory_efficient_attention = True  # Use memory efficient attention
+gradient_checkpointing_interval = 1  # Apply checkpointing every N layers

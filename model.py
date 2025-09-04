@@ -7,7 +7,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from liger_module import LigerRMSNorm, LigerSwiGLUMLP, liger_rotary_pos_emb, LigerCrossEntropyLoss, LigerLayerNorm
+from rwkv_attention_optimized import RWKVAttentionOptimized
 from rwkv_block import RWKVBlock, RWKV8Block
 from dit_prior import DiTPrior, DiTConfig
 
@@ -35,6 +37,9 @@ class LTMConfig:
     use_rwkv: bool = True  # Whether to use RWKV instead of transformer
     use_rwkv8_ffn: bool = True  # Whether to use RWKV-8 feed-forward network
     head_size: int = 64  # RWKV head size
+    # Optimization flags
+    use_optimized_rwkv: bool = True
+    gradient_checkpointing: bool = False
     rwkv_mode: str = "rwkv8"  # RWKV mode: "rwkv7" or "rwkv8"
     
     # DiT prior parameters
@@ -229,14 +234,17 @@ class Attention(nn.Module):
                 float('-inf')
             )
         elif padding_mask is not None:
-            expanded_mask = padding_mask.unsqueeze(1).unsqueeze(-1)  # [batch_size, 1, seq_len_q, 1]
+            # Self-attn padding
+            expanded_mask = padding_mask.unsqueeze(1).unsqueeze(-1)  # [B, 1, seq_len_q, 1]
             xq = xq * expanded_mask
-            cross_attn_mask = padding_mask.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, z.shape[1])
-            attn_mask = torch.where(
-                cross_attn_mask == 1,
-                torch.tensor(0.0, device=cross_attn_mask.device),
-                torch.tensor(float('-inf'), device=cross_attn_mask.device)
-            )
+            # Cross-attn padding (only if cross_attention)
+            if self.cross_attention and z is not None:
+                cross_attn_mask = padding_mask.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, z.shape[1])
+                attn_mask = torch.where(
+                    cross_attn_mask == 1,
+                    torch.tensor(0.0, device=cross_attn_mask.device),
+                    torch.tensor(float('-inf'), device=cross_attn_mask.device)
+                )
         
         if self.flash:
             output = torch.nn.functional.scaled_dot_product_attention(
@@ -444,7 +452,7 @@ class LatentThoughtModel(nn.Module):
         if z is not None:
             z = z.view(_bsz, self.n_layers, self.max_z_len, -1)
 
-        if self.use_z_pos_emb:
+        if self.use_z_pos_emb and z is not None:
             seq_len_z = z.shape[2]
             freqs_cos_z = self.freqs_cos_z[:seq_len_z]
             freqs_sin_z = self.freqs_sin_z[:seq_len_z]
@@ -453,11 +461,16 @@ class LatentThoughtModel(nn.Module):
             freqs_sin_z = None
 
         for i, layer in enumerate(self.layers):
-            if z is not None and layer.use_cross_attention:
-                # Use layer-specific latent vectors
-                h = layer(h, freqs_cos, freqs_sin, z[:, i, :, :], freqs_cos_z, freqs_sin_z)
+            if self.training and getattr(self.params, 'gradient_checkpointing', False):
+                def _fn(h_local, z_local):
+                    return layer(h_local, freqs_cos, freqs_sin, z_local, freqs_cos_z, freqs_sin_z)
+                z_i = z[:, i, :, :] if (z is not None and layer.use_cross_attention) else None
+                h = checkpoint(_fn, h, z_i)
             else:
-                h = layer(h, freqs_cos, freqs_sin)
+                if z is not None and layer.use_cross_attention:
+                    h = layer(h, freqs_cos, freqs_sin, z[:, i, :, :], freqs_cos_z, freqs_sin_z)
+                else:
+                    h = layer(h, freqs_cos, freqs_sin)
         h = self.norm(h)
         return h
 
@@ -668,25 +681,23 @@ class LatentThoughtModel(nn.Module):
     
     def compute_dit_kl_loss(self, mu: torch.Tensor, log_var: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Compute KL divergence using DiT prior."""
-        batch_size = mu.shape[0]
-        
-        # Reshape mu to match DiT input format
-        mu_reshaped = mu.view(batch_size, self.n_layers, -1, self.params.dim)
-        
-        # Get DiT prior predictions
-        with torch.no_grad():
-            # Use DiT to predict noise for the given timesteps
-            noise_pred = self.dit_prior(mu_reshaped, timesteps)
-        
-        # Simple KL approximation using the difference between predicted and actual noise
-        # This is a simplified approach - in practice, you might want a more sophisticated KL computation
-        std = torch.exp(0.5 * log_var)
-        actual_noise = torch.randn_like(mu) * std
-        
-        # Compute MSE between predicted and actual noise as a proxy for KL
-        kl_approx = F.mse_loss(noise_pred, actual_noise, reduction='sum')
-        
-        return kl_approx
+        B, TZ, D = mu.shape
+        L = self.n_layers
+        Z = TZ // L
+        mu_4d = mu.view(B, L, Z, D)
+        log_var_4d = log_var.view(B, L, Z, D)
+
+        # Flatten layers as independent sequences for DiT
+        mu_flat = mu_4d.reshape(B * L, Z, D)
+        t_flat = timesteps.repeat_interleave(L, dim=0)  # [B*L]
+
+        # Let gradients flow so DiT learns
+        noise_pred = self.dit_prior(mu_flat, t_flat)  # [B*L, Z, D]
+        noise_pred = noise_pred.view(B, L, Z, D)
+
+        std = torch.exp(0.5 * log_var_4d)
+        noise = torch.randn_like(std)  # predict noise
+        return F.mse_loss(noise_pred, noise, reduction='sum')
     
     def sample_from_prior(self, batch_size: int, device: torch.device,
                          num_steps: Optional[int] = None) -> torch.Tensor:

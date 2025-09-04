@@ -35,6 +35,14 @@ class SimCSEPooler(nn.Module):
         Returns:
             Sentence embeddings [batch_size, hidden_dim]
         """
+        # If outputs is a tensor (e.g., LTM returns hidden states directly), pool it
+        if isinstance(outputs, torch.Tensor):
+            last_hidden = outputs
+            # Default for GPT-style: average pooling
+            return ((last_hidden * attention_mask.unsqueeze(-1)).sum(1) /
+                    attention_mask.sum(-1).unsqueeze(-1))
+
+        # Otherwise assume a HF-style object
         last_hidden = outputs.last_hidden_state
         hidden_states = outputs.hidden_states
         
@@ -170,7 +178,8 @@ class SimCSEModule(nn.Module):
     def encode_sentences(self, 
                         input_ids: torch.Tensor,
                         attention_mask: torch.Tensor,
-                        return_embeddings: bool = False) -> torch.Tensor:
+                        return_embeddings: bool = False,
+                        z: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Encode sentences into embeddings.
         
@@ -178,13 +187,14 @@ class SimCSEModule(nn.Module):
             input_ids: Input token IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
             return_embeddings: Whether to return raw embeddings or apply projection
+            z: Latent variables [batch_size, z_len, z_dim]
             
         Returns:
             Sentence embeddings [batch_size, hidden_dim] or [batch_size, projection_dim]
         """
         # Get model outputs
         with torch.no_grad():
-            outputs = self.model.decoder_forward(input_ids)
+            outputs = self.model.decoder_forward(input_ids, z)
         
         # Apply pooling
         embeddings = self.pooler(attention_mask, outputs)
@@ -197,24 +207,24 @@ class SimCSEModule(nn.Module):
     
     def compute_contrastive_loss(self, 
                                batch1: Dict[str, torch.Tensor],
-                               batch2: Dict[str, torch.Tensor]) -> torch.Tensor:
+                               batch2: Dict[str, torch.Tensor],
+                               z1: Optional[torch.Tensor] = None,
+                               z2: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Compute contrastive loss between two batches of sentences.
         
         Args:
             batch1: First batch containing 'input_ids' and 'attention_mask'
             batch2: Second batch containing 'input_ids' and 'attention_mask'
+            z1: Latent variables for first batch
+            z2: Latent variables for second batch
             
         Returns:
             Contrastive loss value
         """
         # Encode both batches
-        embeddings1 = self.encode_sentences(
-            batch1['input_ids'], batch1['attention_mask']
-        )
-        embeddings2 = self.encode_sentences(
-            batch2['input_ids'], batch2['attention_mask']
-        )
+        embeddings1 = self.encode_sentences(batch1['input_ids'], batch1['attention_mask'], z=z1)
+        embeddings2 = self.encode_sentences(batch2['input_ids'], batch2['attention_mask'], z=z2)
         
         # Compute contrastive loss
         contrastive_loss = self.contrastive_loss(embeddings1, embeddings2)
@@ -240,6 +250,7 @@ class SimCSEModule(nn.Module):
                input_ids: torch.Tensor,
                attention_mask: torch.Tensor,
                targets: Optional[torch.Tensor] = None,
+               z: Optional[torch.Tensor] = None,
                compute_contrastive: bool = False,
                contrastive_batch: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
         """
@@ -249,6 +260,7 @@ class SimCSEModule(nn.Module):
             input_ids: Input token IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
             targets: Target tokens (for language modeling)
+            z: Latent variables [batch_size, z_len, z_dim]
             compute_contrastive: Whether to compute contrastive loss
             contrastive_batch: Second batch for contrastive learning
             
@@ -258,7 +270,7 @@ class SimCSEModule(nn.Module):
         results = {}
         
         # Get model outputs
-        outputs = self.model.decoder_forward(input_ids)
+        outputs = self.model.decoder_forward(input_ids, z)
         
         # Apply pooling
         embeddings = self.pooler(attention_mask, outputs)
@@ -284,7 +296,9 @@ class SimCSEModule(nn.Module):
         if compute_contrastive and contrastive_batch is not None:
             contrastive_loss = self.compute_contrastive_loss(
                 {'input_ids': input_ids, 'attention_mask': attention_mask},
-                contrastive_batch
+                contrastive_batch,
+                z1=z,
+                z2=contrastive_batch.get('z', None)
             )
             results['contrastive_loss'] = contrastive_loss
             
