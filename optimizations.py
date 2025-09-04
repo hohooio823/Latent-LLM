@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple
-
+import torch.nn.functional as F 
+import math
+from model import Attention, FeedForward, RMSNorm, precompute_freqs_cis
+from rwkv_block import RWKVBlock, RWKV8Block
+from liger_module import LigerRMSNorm, LigerSwiGLUMLP, LigerCrossEntropyLoss
+from dit_prior import DiTPrior, DiTConfig
 # =============================================================================
 # CRITICAL PERFORMANCE OPTIMIZATIONS
 # =============================================================================
@@ -120,75 +125,35 @@ class OptimizedRWKVAttention(nn.Module):
         
         return output
     
-    def _rwkv_attention_parallel(self, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+    def _rwkv_attention_parallel(self, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                                 w: torch.Tensor, T: int) -> torch.Tensor:
         """
-        Optimized parallel RWKV attention implementation using cumulative operations
-        This version is significantly faster on GPUs by avoiding Python loops
+        Optimized parallel RWKV attention using per-channel exponential decay.
+        w is a per-channel decay of shape [C] = [H*D], broadcast across batch/time.
         """
         B, _, C = r.shape
-        
-        # Reshape for multi-head attention
-        r = r.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, n_heads, T, head_dim]
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, n_heads, T, head_dim]
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, n_heads, T, head_dim]
-        w = w.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, n_heads, T, head_dim]
-        
-        # Compute all KV products at once
-        # Expand dimensions for batched matrix multiplication
-        k_expanded = k.unsqueeze(-1)  # [B, n_heads, T, head_dim, 1]
-        v_expanded = v.unsqueeze(-2)  # [B, n_heads, T, 1, head_dim]
-        kv_all = torch.matmul(k_expanded, v_expanded)  # [B, n_heads, T, head_dim, head_dim]
-        
-        # Compute cumulative state using parallel operations
-        # Expand w for broadcasting: [B, n_heads, T, 1, 1]
-        w_expanded = w.unsqueeze(-1).unsqueeze(-1)
-        
-        # Initialize state tensor
-        states = torch.zeros(B, self.n_heads, self.head_dim, self.head_dim, 
-                           device=r.device, dtype=r.dtype)
-        
-        # Use parallel scan operations (if available) or optimized cumulative operations
-        try:
-            # Try to use associative_scan if available (requires flash-linear-attention package)
-            from flash_linear_attention import associative_scan
-            
-            # Reshape for associative scan: [B*n_heads, T, head_dim, head_dim]
-            kv_flat = kv_all.view(-1, T, self.head_dim, self.head_dim)
-            w_flat = w_expanded.view(-1, T)
-            
-            # Define scan function
-            def scan_fn(x, y):
-                return x * y.unsqueeze(-1).unsqueeze(-1)
-            
-            # Apply associative scan
-            states_flat = associative_scan(scan_fn, kv_flat, w_flat)
-            states = states_flat.view(B, self.n_heads, T, self.head_dim, self.head_dim)
-            
-        except ImportError:
-            # Fallback to optimized cumulative operations
-            states = torch.zeros_like(kv_all)
-            for t in range(T):
-                if t == 0:
-                    states[:, :, t] = kv_all[:, :, t]
-                else:
-                    states[:, :, t] = states[:, :, t-1] * w_expanded[:, :, t] + kv_all[:, :, t]
-        
-        # Compute all outputs in parallel
-        # Expand r for matrix multiplication: [B, n_heads, T, head_dim, 1]
-        r_expanded = r.unsqueeze(-1)
-        
-        # Batched matrix multiplication: [B, n_heads, T, head_dim, 1]
-        output_expanded = torch.matmul(states, r_expanded)
-        
-        # Squeeze the last dimension
-        output = output_expanded.squeeze(-1)  # [B, n_heads, T, head_dim]
-        
-        # Reshape back to original dimensions
-        output = output.transpose(1, 2).contiguous()  # [B, T, n_heads, head_dim]
-        output = output.view(B, T, -1)  # [B, T, C]
-        
-        return output
+        # Reshape to [B, H, T, D]
+        r = r.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Per-channel constant decay [1, H, 1, D, 1]
+        w_const = w.view(self.n_heads, self.head_dim).unsqueeze(0).unsqueeze(2).unsqueeze(-1)
+
+        # Compute all KV products at once: [B, H, T, D, D]
+        kv_all = torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2))
+
+        # Cumulative state over time (vectorized)
+        states = torch.zeros_like(kv_all)
+        states[:, :, 0] = kv_all[:, :, 0]
+        for t in range(1, T):
+            states[:, :, t] = states[:, :, t - 1] * w_const + kv_all[:, :, t]
+
+        # Multiply states by r across time -> [B, H, T, D]
+        out = torch.matmul(states, r.unsqueeze(-1)).squeeze(-1)
+        # Back to [B, T, C]
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        return out
 
 
 class OptimizedTransformerBlock(nn.Module):

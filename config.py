@@ -104,9 +104,6 @@ min_lr = 4e-5  # Minimum learning rate (typically learning_rate/10)
 device = "cuda"  # Device to use: 'cpu', 'cuda', 'cuda:0', etc.
 dtype = "bfloat16"  # Data type: float32, bfloat16, or float16
 compile = False  # Whether to use PyTorch 2.0 compilation for speed
-# Optimization flags
-gradient_checkpointing: bool = False
-
 # Create a dictionary of all configuration parameters
 def get_config_dict():
     """Return a dictionary containing all configuration parameters."""

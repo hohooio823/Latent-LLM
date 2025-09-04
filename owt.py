@@ -157,6 +157,10 @@ class PretokDatasetWithLatent(torch.utils.data.IterableDataset):
 # -----------------------------------------------------------------------------
 # Public Interface
 # -----------------------------------------------------------------------------
+
+
+class Task:
+    """Task interface for working with the OWT dataset."""
     @staticmethod
     def ensure_dataset_available(split="train", dataset_name="openwebtext", 
                                 cache_dir="data_owt", auto_download=True):
@@ -207,10 +211,6 @@ class PretokDatasetWithLatent(torch.utils.data.IterableDataset):
             print(f"Error downloading dataset: {e}")
             return False
 
-
-class Task:
-    """Task interface for working with the OWT dataset."""
-    
     @staticmethod
     def iter_batches_with_latents(split, batch_size, max_seq_len, max_z_len, z_dim, 
                                   device, num_workers=0, auto_download=True):
@@ -225,9 +225,14 @@ class Task:
             z_dim (int): Dimension of latent variables
             device (str): Device to load tensors to
             num_workers (int): Number of DataLoader workers
+            auto_download (bool): Whether to auto-download dataset
             
         Yields:
             tuple: (x, y, z) containing batches of:
+                - x: Input token tensors [batch_size, max_seq_len]
+                - y: Target token tensors [batch_size, max_seq_len]
+                - z: Latent variable tensors [batch_size, z_dim * max_z_len]
+        """
         # Ensure dataset is available
         from config import DATA_CACHE_DIR
         if not Task.ensure_dataset_available(
@@ -237,10 +242,6 @@ class Task:
         ):
             raise FileNotFoundError(f"Dataset files not found for {split} split and auto_download=False")
         
-                - x: Input token tensors [batch_size, max_seq_len]
-                - y: Target token tensors [batch_size, max_seq_len]
-                - z: Latent variable tensors [batch_size, z_dim * max_z_len]
-        """
         # Create dataset instance
         ds = PretokDatasetWithLatent(
             split=split,

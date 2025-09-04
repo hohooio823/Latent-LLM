@@ -64,7 +64,8 @@ class DatasetDownloader:
             dataset = load_dataset("openwebtext", split=split)
             
             if num_samples is not None:
-                dataset = dataset.select(min(num_samples, len(dataset)))
+                dataset = limit = min(num_samples, len(dataset))
+                dataset = dataset.select(range(limit))
                 
             logger.info(f"Downloaded {len(dataset)} samples from OpenWebText")
             return dataset
@@ -75,7 +76,8 @@ class DatasetDownloader:
             logger.info("Falling back to smaller dataset for testing...")
             dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
             if num_samples is not None:
-                dataset = dataset.select(min(num_samples, len(dataset)))
+                limit = min(num_samples, len(dataset))
+                dataset = dataset.select(range(limit))
             return dataset
     
     def download_custom_dataset(self, dataset_name, split="train", num_samples=None):
@@ -96,7 +98,8 @@ class DatasetDownloader:
             dataset = load_dataset(dataset_name, split=split)
             
             if num_samples is not None:
-                dataset = dataset.select(min(num_samples, len(dataset)))
+                limit = min(num_samples, len(dataset))
+                dataset = dataset.select(range(limit))
                 
             logger.info(f"Downloaded {len(dataset)} samples from {dataset_name}")
             return dataset
