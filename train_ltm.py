@@ -104,6 +104,7 @@ def main():
         z_dim=config.z_dim,
         device=device,
         num_workers=config.num_workers,
+        auto_download=config.DATASET_AUTO_DOWNLOAD,
     )
     
     # -----------------------------------------------------------------------------

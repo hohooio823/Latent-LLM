@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from datasets import load_dataset
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
+from dataset_downloader import DatasetDownloader
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -156,13 +157,63 @@ class PretokDatasetWithLatent(torch.utils.data.IterableDataset):
 # -----------------------------------------------------------------------------
 # Public Interface
 # -----------------------------------------------------------------------------
+    @staticmethod
+    def ensure_dataset_available(split="train", dataset_name="openwebtext", 
+                                cache_dir="data_owt", auto_download=True):
+        """
+        Ensure that the dataset is available for the given split.
+        
+        Args:
+            split (str): Dataset split ('train' or 'val')
+            dataset_name (str): Name of the dataset
+            cache_dir (str): Directory where dataset is cached
+            auto_download (bool): Whether to automatically download if missing
+            
+        Returns:
+            bool: True if dataset is available, False otherwise
+        """
+        bin_dir = os.path.join(cache_dir, "tok_gpt2")
+        bin_files = glob.glob(os.path.join(bin_dir, f"{split}*.bin"))
+        
+        if bin_files:
+            return True
+        
+        if not auto_download:
+            print(f"Dataset files not found for {split} split and auto_download=False")
+            return False
+        
+        print(f"Dataset files not found for {split} split. Downloading...")
+        
+        try:
+            # Initialize downloader
+            downloader = DatasetDownloader(cache_dir=cache_dir)
+            
+            # Download and preprocess dataset
+            success = downloader.download_and_preprocess(
+                dataset_name=dataset_name,
+                split=split,
+                num_samples=None,  # Download all samples
+                num_workers=4
+            )
+            
+            if success:
+                print(f"Successfully downloaded {split} dataset")
+                return True
+            else:
+                print(f"Failed to download {split} dataset")
+                return False
+                
+        except Exception as e:
+            print(f"Error downloading dataset: {e}")
+            return False
+
 
 class Task:
     """Task interface for working with the OWT dataset."""
     
     @staticmethod
     def iter_batches_with_latents(split, batch_size, max_seq_len, max_z_len, z_dim, 
-                                  device, num_workers=0):
+                                  device, num_workers=0, auto_download=True):
         """
         Create an iterable over batches of data with latent variables.
         
@@ -177,6 +228,15 @@ class Task:
             
         Yields:
             tuple: (x, y, z) containing batches of:
+        # Ensure dataset is available
+        from config import DATA_CACHE_DIR
+        if not Task.ensure_dataset_available(
+            split=split, 
+            cache_dir=DATA_CACHE_DIR, 
+            auto_download=auto_download
+        ):
+            raise FileNotFoundError(f"Dataset files not found for {split} split and auto_download=False")
+        
                 - x: Input token tensors [batch_size, max_seq_len]
                 - y: Target token tensors [batch_size, max_seq_len]
                 - z: Latent variable tensors [batch_size, z_dim * max_z_len]
