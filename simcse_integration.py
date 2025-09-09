@@ -80,7 +80,6 @@ class SimilarityFunction(nn.Module):
     def __init__(self, temperature: float = 0.05):
         super().__init__()
         self.temperature = temperature
-        self.cosine_sim = nn.CosineSimilarity(dim=-1)
     
     def forward(self, embeddings1: torch.Tensor, embeddings2: torch.Tensor) -> torch.Tensor:
         """
@@ -93,8 +92,14 @@ class SimilarityFunction(nn.Module):
         Returns:
             Similarity scores [batch_size, batch_size]
         """
-        return self.cosine_sim(embeddings1, embeddings2) / self.temperature
-
+        # Normalize embeddings
+        embeddings1 = F.normalize(embeddings1, p=2, dim=1)
+        embeddings2 = F.normalize(embeddings2, p=2, dim=1)
+        
+        # Compute pairwise cosine similarity
+        similarity_matrix = torch.matmul(embeddings1, embeddings2.T) / self.temperature
+        
+        return similarity_matrix
 
 class SimCSEProjectionHead(nn.Module):
     """
@@ -122,7 +127,6 @@ class SimCSEContrastiveLoss(nn.Module):
     def __init__(self, temperature: float = 0.05):
         super().__init__()
         self.temperature = temperature
-        self.similarity = SimilarityFunction(temperature)
     
     def forward(self, embeddings1: torch.Tensor, embeddings2: torch.Tensor) -> torch.Tensor:
         """
@@ -135,18 +139,22 @@ class SimCSEContrastiveLoss(nn.Module):
         Returns:
             Contrastive loss value
         """
+        batch_size = embeddings1.size(0)
+        
+        # Normalize embeddings
+        embeddings1 = F.normalize(embeddings1, p=2, dim=1)
+        embeddings2 = F.normalize(embeddings2, p=2, dim=1)
+        
         # Compute similarity matrix
-        sim_matrix = self.similarity(embeddings1, embeddings2)  # [batch_size, batch_size]
+        sim_matrix = torch.matmul(embeddings1, embeddings2.T) / self.temperature  # [batch_size, batch_size]
         
         # Create labels (diagonal elements are positive pairs)
-        labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
+        labels = torch.arange(batch_size, dtype=torch.long, device=sim_matrix.device)
         
         # Compute cross-entropy loss
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(sim_matrix, labels)
+        loss = F.cross_entropy(sim_matrix, labels)
         
         return loss
-
 
 class SimCSEModule(nn.Module):
     """
@@ -174,6 +182,17 @@ class SimCSEModule(nn.Module):
             )
         
         self.contrastive_loss = SimCSEContrastiveLoss(temperature)
+    
+    def get_sentence_representations(self, hidden_states: torch.Tensor, 
+                                    attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Extract sentence representations from hidden states.
+        """
+        if attention_mask is None:
+            # If no mask provided, assume all tokens are valid
+            attention_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
+        
+        return self.pooler(attention_mask, hidden_states)
     
     def encode_sentences(self, 
                         input_ids: torch.Tensor,
@@ -284,7 +303,8 @@ class SimCSEModule(nn.Module):
         # Compute language modeling loss if targets are provided
         if targets is not None:
             logits = self.model.output(outputs)
-            if self.model.use_liger:
+            # Check if model has Liger CE and if it's available
+            if hasattr(self.model, 'ce') and self.model.ce is not None:
                 loss = self.model.ce(logits.view(-1, logits.size(-1)), targets.view(-1))
             else:
                 loss = F.cross_entropy(
@@ -307,7 +327,6 @@ class SimCSEModule(nn.Module):
                 results['total_loss'] = results['loss'] + self.simcse_weight * contrastive_loss
         
         return results
-
 
 def create_simcse_integration(model: nn.Module, 
                             config: Dict[str, Any]) -> SimCSEModule:

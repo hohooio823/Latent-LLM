@@ -41,12 +41,13 @@ LATENT_INIT_SCALE = 0.01
 # Dataset Implementation
 # -----------------------------------------------------------------------------
 
-class PretokDatasetWithLatent(torch.utils.data.IterableDataset):
+class PretokDatasetWithLatent(torch.utils.data.Dataset):
     """
-    Loads pretokenized examples from disk and yields them as PyTorch tensors with latent variables.
+    Loads pretokenized examples from disk and serves them as PyTorch tensors with latent variables.
+    This class uses a regular Dataset interface for better multi-worker support.
     """
 
-    def __init__(self, split, max_seq_len, max_z_len, z_dim):
+    def __init__(self, split, max_seq_len, max_z_len, z_dim, num_workers=0):
         """
         Initialize the dataset.
         
@@ -55,36 +56,15 @@ class PretokDatasetWithLatent(torch.utils.data.IterableDataset):
             max_seq_len (int): Maximum sequence length for tokens
             max_z_len (int): Maximum length of latent vectors
             z_dim (int): Dimension of latent vectors
+            num_workers (int): Number of DataLoader workers (for worker-specific setup)
         """
         super().__init__()
         self.split = split
         self.max_seq_len = max_seq_len
         self.max_z_len = max_z_len
         self.z_dim = z_dim
-
-    def __iter__(self):
-        """
-        Iterator that yields tokenized examples with latent variables.
+        self.num_workers = num_workers
         
-        Yields:
-            tuple: (x, y, z) where:
-                - x is the input token sequence
-                - y is the target token sequence (shifted by 1)
-                - z is the latent variable vector
-        """
-        # Set up worker-specific RNG
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        
-        # Get distributed training rank if applicable
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        
-        # Create a unique seed based on worker and rank
-        seed = DEFAULT_SEED + worker_id + RANK_SEED_OFFSET * rank
-        rng = random.Random(seed)
-        current_shard = None
-        print(f"Created a PretokDatasetWithLatent with rng seed {seed}")
-
         # Find all available data shards
         bin_dir = os.path.join(DATA_CACHE_DIR, "tok_gpt2")
         shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
@@ -97,53 +77,75 @@ class PretokDatasetWithLatent(torch.utils.data.IterableDataset):
             
         assert len(shard_filenames) > 0, f"No bin files found in {bin_dir}"
         
-        # Infinite iteration for training
-        while True:
-            # Shuffle the order of shards
-            rng.shuffle(shard_filenames)
+        # Build index of all examples across all shards
+        self.examples = []
+        self.shard_info = []
+        
+        print(f"Building dataset index for {split} split...")
+        for shard in shard_filenames:
+            # Load the shard data using memory mapping
+            m = np.memmap(shard, dtype=np.uint16, mode="r")
             
-            # Process each shard
-            for shard in shard_filenames:
-                if shard != current_shard:
-                    current_shard = shard
-                    print(f"Switching to new shard: {shard}")
+            # Calculate number of complete batches in this shard
+            num_batches = len(m) // self.max_seq_len
+            num_batches -= 1  # drop the last partial batch
+            assert num_batches > 0, "This shard is way too small. Please investigate."
+            
+            # Store shard information
+            self.shard_info.append({
+                'filename': shard,
+                'num_batches': num_batches,
+                'offset': len(self.examples)
+            })
+            
+            # Add examples to index
+            self.examples.extend([(shard, i) for i in range(num_batches)])
+            
+        print(f"Dataset index built with {len(self.examples)} examples")
+        
+        # Store latent variable parameters instead of generating all at once
+        # This saves significant memory during dataset initialization
+        self.latent_seed = DEFAULT_SEED + len(self.examples)
+        self.latent_vars = None  # Generate on-demand
 
-                # Load the shard data using memory mapping
-                m = np.memmap(shard, dtype=np.uint16, mode="r")
-                
-                # Calculate number of complete batches in this shard
-                num_batches = len(m) // self.max_seq_len
-                num_batches -= 1  # drop the last partial batch
-                assert num_batches > 0, "This shard is way too small. Please investigate."
+    def __len__(self):
+        """Return the total number of examples in the dataset."""
+        return len(self.examples)
 
-                # Generate random latent variables for all batches in this shard
-                z_matrix = np.random.randn(
-                    num_batches, 
-                    self.z_dim * self.max_z_len
-                ).astype(np.float32) * LATENT_INIT_SCALE
-                
-                # Shuffle batch indices for randomness
-                ixs = list(range(num_batches))
-                rng.shuffle(ixs)
-                
-                # Process each batch
-                for ix in ixs:
-                    # Extract token sequence
-                    start = ix * self.max_seq_len
-                    end = start + self.max_seq_len + 1
-                    
-                    # Convert to PyTorch tensor and move to appropriate data type
-                    chunk = torch.from_numpy((m[start:end]).astype(np.int64))
-                    
-                    # Create input and target sequences (shifted by one token)
-                    x = chunk[:-1]  # Input tokens
-                    y = chunk[1:]   # Target tokens (next token prediction)
-                    
-                    # Get latent vector for this batch
-                    z = z_matrix[ix]
-                    
-                    # Yield the example
-                    yield x, y, z
+    def __getitem__(self, idx):
+        """
+        Get a single example by index.
+        
+        Args:
+            idx (int): Index of the example to retrieve
+            
+        Returns:
+            tuple: (x, y, z) where:
+                - x is the input token sequence
+                - y is the target token sequence (shifted by 1)
+                - z is the latent variable vector
+        """
+        shard_info, batch_idx = self.examples[idx]
+        
+        # Load the shard data using memory mapping
+        m = np.memmap(shard_info, dtype=np.uint16, mode="r")
+        
+        # Extract token sequence
+        start = batch_idx * self.max_seq_len
+        end = start + self.max_seq_len + 1
+        
+        # Convert to PyTorch tensor and move to appropriate data type
+        chunk = torch.from_numpy((m[start:end]).astype(np.int64))
+        
+        # Create input and target sequences (shifted by one token)
+        x = chunk[:-1]  # Input tokens
+        y = chunk[1:]   # Target tokens (next token prediction)
+        
+        # Generate latent vector for this batch truly on-demand to save memory
+        rng = np.random.RandomState(self.latent_seed + idx)
+        z = rng.randn(self.z_dim * self.max_z_len).astype(np.float32) * LATENT_INIT_SCALE
+        
+        return x, y, z
     
     @staticmethod
     def get_shard_id(shard_file_name):
@@ -212,7 +214,7 @@ class Task:
             return False
 
     @staticmethod
-    def iter_batches_with_latents(split, batch_size, max_seq_len, max_z_len, z_dim, 
+    def iter_batches_with_latents(split, batch_size, max_seq_len, max_z_len, z_dim,
                                   device, num_workers=0, auto_download=True):
         """
         Create an iterable over batches of data with latent variables.
@@ -236,8 +238,8 @@ class Task:
         # Ensure dataset is available
         from config import DATA_CACHE_DIR
         if not Task.ensure_dataset_available(
-            split=split, 
-            cache_dir=DATA_CACHE_DIR, 
+            split=split,
+            cache_dir=DATA_CACHE_DIR,
             auto_download=auto_download
         ):
             raise FileNotFoundError(f"Dataset files not found for {split} split and auto_download=False")
@@ -247,15 +249,19 @@ class Task:
             split=split,
             max_seq_len=max_seq_len,
             max_z_len=max_z_len,
-            z_dim=z_dim
+            z_dim=z_dim,
+            num_workers=num_workers
         )
         
-        # Create DataLoader
+        # Create DataLoader with shuffle for training, no shuffle for validation
+        shuffle = (split == "train")
         dl = torch.utils.data.DataLoader(
-            ds, 
-            batch_size=batch_size, 
-            pin_memory=True, 
-            num_workers=num_workers
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            pin_memory=True,
+            num_workers=num_workers,
+            drop_last=True  # Drop last incomplete batch
         )
         
         # Process and yield batches

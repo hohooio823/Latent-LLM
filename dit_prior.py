@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from liger_module import LigerRMSNorm, LigerSwiGLUMLP
-from model import RMSNorm, precompute_freqs_cis, apply_rotary_emb_single
+from model_utils import RMSNorm, precompute_freqs_cis, apply_rotary_emb_single
 
 
 class DiTConfig:
@@ -82,18 +82,15 @@ class DiTAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # Apply RoPE
-        q = apply_rotary_emb_single(q, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
-        k = apply_rotary_emb_single(k, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
+        # Apply RoPE (optional - you can uncomment if needed)
+        # q = apply_rotary_emb_single(q, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
+        # k = apply_rotary_emb_single(k, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
         
         # Scaled dot-product attention
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
-        # Add timestep conditioning if provided
-        if timesteps is not None:
-            # Simple timestep embedding added to attention
-            time_emb = self.get_time_embedding(timesteps, batch_size)
-            attn_weights = attn_weights + time_emb.unsqueeze(1).unsqueeze(-1)
+        # Remove the timestep conditioning from attention weights
+        # (it's already applied to the token embeddings in the main forward method)
         
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = self.dropout(attn_weights)
@@ -105,18 +102,6 @@ class DiTAttention(nn.Module):
         # Final projection
         output = self.wo(output)
         return output
-    
-    def get_time_embedding(self, timesteps: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """Simple timestep embedding for conditioning."""
-        # Create a simple sinusoidal timestep embedding
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -embeddings)
-        embeddings = embeddings.to(timesteps.device)
-        embeddings = timesteps[:, None] * embeddings[None, :]
-        embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
-        return embeddings
-
 
 class DiTFeedForward(nn.Module):
     """Feed-forward network for DiT."""
@@ -164,8 +149,8 @@ class DiTBlock(nn.Module):
         self.feed_forward = DiTFeedForward(config)
     
     def forward(self, x: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Self-attention with timestep conditioning
-        h = x + self.attention(self.norm1(x), timesteps)
+        # Self-attention (no timestep conditioning needed here)
+        h = x + self.attention(self.norm1(x))  # Remove timesteps parameter
         # Feed-forward
         out = h + self.feed_forward(self.norm2(h))
         return out

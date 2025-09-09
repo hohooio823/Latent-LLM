@@ -90,8 +90,18 @@ class RWKVAttentionOptimized(nn.Module):
         if self.cross_attention and z is not None:
             assert z.shape[0] == B and z.shape[-1] == C, "Batch size and embedding dimension must match"
             # Use z for key and value in cross attention
-            k = self.key(z)
-            v = self.value(z)
+            # Note: z might have different sequence length than x
+            T_z = z.shape[1]  # Get the actual sequence length of z
+            
+            # Apply time mixing to z for keys and values
+            zz = torch.cat([z[:, 1:2, :], z[:, :-1, :]], dim=1) - z if T_z > 1 else torch.zeros_like(z)
+            zk = z + zz * self.time_mix_k
+            zv = z + zz * self.time_mix_v
+            
+            k = self.key(zk)
+            v = self.value(zv)
+        else:
+            T_z = T  # For self-attention, use same sequence length
         
         # Handle full attention (no causal mask)
         if self.full_attention:
@@ -101,7 +111,11 @@ class RWKVAttentionOptimized(nn.Module):
             attn_output = torch.matmul(attn_output, v)
         else:
             # Use optimized RWKV attention
-            attn_output = self._rwkv_attention_parallel(r, k, v, w, T)
+            if self.cross_attention and z is not None:
+                # For cross-attention, use special handling
+                attn_output = self._rwkv_cross_attention(r, k, v, w, T, T_z)
+            else:
+                attn_output = self._rwkv_attention_parallel(r, k, v, w, T)
         
         # Apply output projection and gating
         output = self.output(attn_output * g)
@@ -110,33 +124,36 @@ class RWKVAttentionOptimized(nn.Module):
         output = self.ln_x(output)
         
         return output
-    
-    def _rwkv_attention_parallel(self, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                                w: torch.Tensor, T: int) -> torch.Tensor:
-        B, _, C = r.shape
+
+    def _rwkv_cross_attention(self, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                            w: torch.Tensor, T_q: int, T_kv: int) -> torch.Tensor:
+        """
+        Cross-attention version of RWKV where queries come from x and keys/values from z
+        """
+        B = r.shape[0]
         
         # Reshape for multi-head attention
-        r = r.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        r = r.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, T_q, D]
+        k = k.view(B, T_kv, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, T_kv, D]
+        v = v.view(B, T_kv, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, T_kv, D]
         
-        # Per-channel constant decay (broadcast across batch/time)
-        w_const = w.view(1, self.n_heads, 1, self.head_dim, 1)  # [1, H, 1, D, 1]
+        # For cross-attention, we don't use the sequential state mechanism
+        # Instead, we compute attention between all query-key pairs
+        # This is similar to standard attention but with RWKV-style weighting
         
-        # Compute all KV products at once: [B,H,T,D,D]
-        kv_all = torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2))
+        # Compute attention scores
+        scores = torch.matmul(r, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [B, H, T_q, T_kv]
         
-        # Cumulative state over time (vectorized across B and H)
-        states = torch.zeros_like(kv_all)
-        states[:, :, 0] = kv_all[:, :, 0]
-        for t in range(1, T):
-            states[:, :, t] = states[:, :, t - 1] * w_const + kv_all[:, :, t]
+        # Apply softmax
+        attn_weights = F.softmax(scores, dim=-1)
         
-        # Multiply states by r across time
-        out = torch.matmul(states, r.unsqueeze(-1)).squeeze(-1)   # [B, H, T, D]
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)     # [B, T, C]
-        return out
-    
+        # Apply attention to values
+        out = torch.matmul(attn_weights, v)  # [B, H, T_q, D]
+        
+        # Reshape back
+        out = out.transpose(1, 2).contiguous().view(B, T_q, -1)  # [B, T_q, C]
+        
+        return out    
     def _rwkv_attention_fused(self, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
                              w: torch.Tensor, T: int) -> torch.Tensor:
         """

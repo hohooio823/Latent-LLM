@@ -1,0 +1,27 @@
+# Core ML and Deep Learning
+torch>=2.5.0
+torchaudio>=2.5.0
+torchvision>=0.18.0
+
+# Data Processing and Analysis
+numpy==1.24.3
+pandas>=2.0.3
+
+# NLP and Transformers
+transformers>=4.45.0
+tiktoken>=0.6.0
+sentencepiece>=0.2.0
+tokenizers>=0.20,<0.21
+
+# Hugging Face ecosystem
+huggingface-hub>=0.23.2
+safetensors>=0.4.2
+
+# Utilities and Tools
+wandb>=0.16.6
+liger-kernel>=0.1.0
+flash-linear-attention>=0.1.2
+datasets>=3.3.0
+requests>=2.31.0
+tqdm>=4.66.0
+psutil==7.0.0

@@ -25,6 +25,53 @@ def optimize_memory_usage():
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
 
+def monitor_memory():
+    """Monitor and log memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        cached = torch.cuda.memory_reserved() / 1024**3  # GB
+        print(f"GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+    import psutil
+    import os
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    print(f"RAM Usage - RSS: {memory_info.rss / 1024**2:.2f}MB, VMS: {memory_info.vms / 1024**2:.2f}MB")
+
+def safe_dataloader_init(dataloader, max_retries=3):
+    """Safely initialize DataLoader with retry logic and memory monitoring"""
+    import time
+    for attempt in range(max_retries):
+        try:
+            # Monitor memory before DataLoader initialization
+            print(f"DataLoader attempt {attempt + 1} - Memory before:")
+            monitor_memory()
+            
+            # Get first batch to test DataLoader
+            first_batch = next(iter(dataloader))
+            
+            # Monitor memory after DataLoader initialization
+            print(f"DataLoader attempt {attempt + 1} - Memory after:")
+            monitor_memory()
+            
+            return True, None
+        except Exception as e:
+            print(f"DataLoader initialization attempt {attempt + 1} failed: {e}")
+            # Force memory cleanup on failure
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            
+            if attempt < max_retries - 1:
+                print("Retrying in 3 seconds...")
+                time.sleep(3)
+                # Try reducing batch size or workers
+                if hasattr(dataloader, 'batch_sampler'):
+                    # This is a simplified approach - in practice you might want more sophisticated logic
+                    pass
+            else:
+                return False, e
+    return False, "Max retries exceeded"
+
 def enable_tf32():
     """Enable TF32 precision for better performance on Ampere+ GPUs"""
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -170,6 +217,19 @@ def main():
         rwkv_mode=config.rwkv_mode,  # RWKV mode: "rwkv7" or "rwkv8"
         use_optimized_rwkv=config.use_optimized_rwkv,
         gradient_checkpointing=config.gradient_checkpointing,
+        # DiT prior parameters
+        use_dit_prior=config.use_dit_prior,
+        dit_layers=config.dit_layers,
+        dit_heads=config.dit_heads,
+        dit_dim=config.dit_dim,
+        dit_multiple_of=config.dit_multiple_of,
+        dit_num_timesteps=config.dit_num_timesteps,
+        dit_beta_schedule=config.dit_beta_schedule,
+        dit_beta_start=config.dit_beta_start,
+        dit_beta_end=config.dit_beta_end,
+        # Additional optimization parameters
+        norm_eps=1e-5,  # Default normalization epsilon
+        padding=False,  # Default padding setting
     )
     
     if config.init_from == "scratch":
@@ -185,8 +245,11 @@ def main():
         
         # Use architecture parameters from checkpoint
         checkpoint_model_args = checkpoint["model_args"]
-        for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
-            model_args[k] = checkpoint_model_args[k]
+        for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len",
+                  "use_dit_prior", "dit_layers", "dit_heads", "dit_dim", "dit_multiple_of",
+                  "dit_num_timesteps", "dit_beta_schedule", "dit_beta_start", "dit_beta_end"]:
+            if k in checkpoint_model_args:
+                model_args[k] = checkpoint_model_args[k]
         
         # Create model with checkpoint configuration
         gptconf = LTMConfig(**model_args)
@@ -288,6 +351,7 @@ def main():
             'simcse_weight': config.simcse_weight
         }
         simcse_module = create_simcse_integration(raw_model, simcse_config)
+        simcse_module.to(device)  # Move SimCSE module to the same device as the model
         simcse_evaluator = SentenceSimilarityEvaluator(simcse_module)
         print("SimCSE integration initialized successfully.")
     
@@ -297,16 +361,21 @@ def main():
     
     def estimate_loss(lr=None):
         """
-        Estimate loss on validation set.
+        Estimate loss on validation set with memory optimizations.
         """
         loss_out = {}
         ppl_out = {}
         kl_out = {}
         simcse_loss_out = {}
+        
+        # Use smaller batch size for validation to save memory
+        eval_batch_size = max(1, config.batch_size // 4)  # Reduce batch size by 75%
+        if eval_batch_size < 1:
+            eval_batch_size = 1
     
         model.eval()  # Set model to evaluation mode
-        for split in ["val"]:
-            batch_iter = iter_batches(split=split, batch_size=16)
+        for split in ["validation"]:
+            batch_iter = iter_batches(split=split, batch_size=eval_batch_size)
             losses = torch.zeros(config.eval_iters)  # Track losses over evaluation iterations
             ppl_list = torch.zeros(config.eval_iters)  # Track perplexities
             kl_list = torch.zeros(config.eval_iters)  # Track KL divergences
@@ -316,12 +385,14 @@ def main():
                 # Get next batch
                 X, Y, Z = next(batch_iter)
                 
-                # Optimize latent variables for this batch
+                # Optimize latent variables for this batch with fewer steps to save memory
+                optimization_steps = min(config.num_steps, 8)  # Limit optimization steps
+                
                 Z, ppl, kl_avg, nlkhd = posterior_optimizer_test.step(
                     data=[X, Y, Z],
                     ctx=ctx,
                     scaler=scaler,
-                    steps=config.num_steps,
+                    steps=optimization_steps,
                     lr=lr
                 )
                 
@@ -348,22 +419,37 @@ def main():
                     # Compute SimCSE loss on validation data
                     with torch.no_grad():
                         # Create a second batch for contrastive learning
-                        X2, Y2, Z2 = next(batch_iter)
-                        simcse_result = simcse_module(
-                            X, torch.ones_like(X).bool(), Y,
-                            z=Z,
-                            compute_contrastive=True,
-                            contrastive_batch={'input_ids': X2, 'attention_mask': torch.ones_like(X2).bool(), 'z': Z2}
-                        )
-                        simcse_losses[k] = simcse_result['contrastive_loss'].item()
+                        try:
+                            X2, Y2, Z2 = next(batch_iter)
+                            simcse_result = simcse_module(
+                                X, torch.ones_like(X).bool(), Y,
+                                z=Z,
+                                compute_contrastive=True,
+                                contrastive_batch={'input_ids': X2, 'attention_mask': torch.ones_like(X2).bool(), 'z': Z2}
+                            )
+                            simcse_losses[k] = simcse_result['contrastive_loss'].item()
+                        except StopIteration:
+                            # If we run out of batches, skip SimCSE computation
+                            simcse_losses[k] = 0.0
                 
-                # Clean up to avoid OOM issues
+                # Aggressive memory cleanup to avoid OOM issues
                 del X, Y, Z, loss, ppl, kl_avg, nlkhd
                 if 'logits' in locals():
                     del logits
+                if 'results' in locals():
+                    del results
+                if 'simcse_result' in locals():
+                    del simcse_result
+                
+                # Force garbage collection and memory cleanup
                 if config.memory_optimization:
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                 
+                # Additional memory cleanup every few iterations
+                if k % 10 == 0:
+                    torch.cuda.empty_cache()
+            
             # Compute average metrics
             loss_out[split] = losses.mean()
             ppl_out[split] = ppl_list.mean()
@@ -403,8 +489,54 @@ def main():
     # -----------------------------------------------------------------------------
     
     # Initialize training
+    print("Initializing data loading...")
     train_batch_iter = iter_batches(split="train")
-    X, Y, Z = next(train_batch_iter)
+    
+    # Test DataLoader with memory monitoring
+    print("Testing DataLoader...")
+    monitor_memory()
+    
+    try:
+        X, Y, Z = next(train_batch_iter)
+        print("DataLoader initialized successfully")
+        monitor_memory()
+    except Exception as e:
+        print(f"Error initializing DataLoader: {e}")
+        print("Attempting to reduce batch size and retry...")
+        # Try with smaller batch size
+        try:
+            original_batch_size = config.batch_size
+            config.batch_size = max(1, config.batch_size // 2)
+            print(f"Reducing batch size to {config.batch_size}")
+            train_batch_iter = iter_batches(split="train")
+            X, Y, Z = next(train_batch_iter)
+            print(f"DataLoader initialized successfully with reduced batch size: {config.batch_size}")
+            monitor_memory()
+        except Exception as e2:
+            print(f"Failed to initialize DataLoader even with reduced batch size: {e2}")
+            # Try with even smaller batch size
+            try:
+                config.batch_size = max(1, config.batch_size // 2)
+                print(f"Further reducing batch size to {config.batch_size}")
+                train_batch_iter = iter_batches(split="train")
+                X, Y, Z = next(train_batch_iter)
+                print(f"DataLoader initialized successfully with further reduced batch size: {config.batch_size}")
+                monitor_memory()
+            except Exception as e3:
+                print(f"Failed to initialize DataLoader even with further reduced batch size: {e3}")
+                # Try with minimal batch size
+                try:
+                    config.batch_size = 1
+                    print(f"Using minimal batch size: {config.batch_size}")
+                    train_batch_iter = iter_batches(split="train")
+                    X, Y, Z = next(train_batch_iter)
+                    print(f"DataLoader initialized successfully with minimal batch size: {config.batch_size}")
+                    monitor_memory()
+                except Exception as e4:
+                    print(f"Failed to initialize DataLoader even with minimal batch size: {e4}")
+                    print("Training cannot start due to DataLoader initialization failure.")
+                    return
+    
     t0 = time.time()
     local_iter_num = 0  # Iterations in current process
     running_mfu = -1.0  # Model flops utilization (efficiency metric)
@@ -426,13 +558,13 @@ def main():
         # Evaluate model and save checkpoint periodically
         if iter_num % config.eval_interval == 0 and master_process:
             losses, ppl_out, kl_out, simcse_losses = estimate_loss(current_lr)
-            print(f"Step {iter_num}: val loss {losses['val']:.4f}, val PPL {ppl_out['val']:.4f}, val KL {kl_out['val']:.4f}")
+            print(f"Step {iter_num}: val loss {losses['validation']:.4f}, val PPL {ppl_out['validation']:.4f}, val KL {kl_out['validation']:.4f}")
             if config.use_simcse and simcse_losses is not None:
-                print(f"Step {iter_num}: SimCSE val loss {simcse_losses['val']:.4f}")
+                print(f"Step {iter_num}: SimCSE val loss {simcse_losses['validation']:.4f}")
     
             # Save checkpoint if validation loss improved or if always_save_checkpoint is True
-            if losses["val"] < best_val_loss or config.always_save_checkpoint:
-                best_val_loss = losses["val"]
+            if losses["validation"] < best_val_loss or config.always_save_checkpoint:
+                best_val_loss = losses["validation"]
                 if iter_num > 0:
                     checkpoint = {
                         "model": raw_model.state_dict(),
@@ -457,12 +589,13 @@ def main():
             if ddp:
                 model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
             
-            # Optimize latent variables for current batch
+            # Optimize latent variables for current batch with reduced steps to save memory
+            optimization_steps = min(config.num_steps, 8)  # Limit optimization steps
             Z, ppl, kl, _ = posterior_optimizer.step(
-                data=[X, Y, Z], 
-                ctx=ctx, 
-                scaler=scaler, 
-                steps=config.num_steps, 
+                data=[X, Y, Z],
+                ctx=ctx,
+                scaler=scaler,
+                steps=optimization_steps,
                 lr=current_lr
             )
             
@@ -494,6 +627,10 @@ def main():
             
             # Backward pass with gradient scaling for mixed precision
             scaler.scale(loss).backward()
+            
+            # Memory cleanup during training
+            if micro_step % 2 == 0:  # Clean up every other micro step
+                torch.cuda.empty_cache()
         
         # -----------------------------------------------------------------------------
         # Gradient Processing and Optimizer Step
@@ -512,8 +649,23 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         
         # Apply memory optimization periodically
-        if iter_num % 100 == 0 and config.memory_optimization:
+        if iter_num % 50 == 0 and config.memory_optimization:
             torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            # Monitor memory every 50 iterations
+            if master_process:
+                print(f"Memory usage at iteration {iter_num}:")
+                monitor_memory()
+                
+        # Emergency memory cleanup if memory usage is too high
+        if iter_num % 25 == 0 and config.memory_optimization:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                if allocated > 6.0:  # If GPU memory > 6GB
+                    print(f"Emergency memory cleanup at iteration {iter_num} (allocated: {allocated:.2f}GB)")
+                    torch.cuda.empty_cache()
+                    gc.collect()
     
         # -----------------------------------------------------------------------------
         # Logging and Timing

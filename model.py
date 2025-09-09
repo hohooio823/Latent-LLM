@@ -12,6 +12,7 @@ from liger_module import LigerRMSNorm, LigerSwiGLUMLP, liger_rotary_pos_emb, Lig
 from rwkv_attention_optimized import RWKVAttentionOptimized
 from rwkv_block import RWKVBlock, RWKV8Block
 from dit_prior import DiTPrior, DiTConfig
+from model_utils import RMSNorm, precompute_freqs_cis, apply_rotary_emb, apply_rotary_emb_single
 
 @dataclass
 class LTMConfig:
@@ -54,80 +55,6 @@ class LTMConfig:
     dit_beta_end: float = 0.02  # Ending beta value
 
 
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
-
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cos = torch.cos(freqs)  # real part
-    freqs_sin = torch.sin(freqs)  # imaginary part
-    return freqs_cos, freqs_sin
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-
-    # reshape xq and xk to match the complex representation
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
-
-    # reshape freqs_cos and freqs_sin for broadcasting
-    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
-    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
-
-    # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
-
-    # flatten last two dimensions
-    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
-    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
-
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-def apply_rotary_emb_single(
-    x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
-) -> torch.Tensor:
-
-    # reshape x to match the complex representation
-    x_r, x_i = x.float().reshape(x.shape[:-1] + (-1, 2)).unbind(-1)
-
-    # reshape freqs_cos and freqs_sin for broadcasting
-    freqs_cos = reshape_for_broadcast(freqs_cos, x_r)
-    freqs_sin = reshape_for_broadcast(freqs_sin, x_r)
-
-    # apply rotation using real numbers
-    x_out_r = x_r * freqs_cos - x_i * freqs_sin
-    x_out_i = x_r * freqs_sin + x_i * freqs_cos
-
-    # flatten last two dimensions
-    x_out = torch.stack([x_out_r, x_out_i], dim=-1).flatten(3)
-
-    return x_out.type_as(x)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -364,16 +291,11 @@ class LatentThoughtModel(nn.Module):
                 self.layers.append(TransformerBlock(layer_id, params, use_cross_attention=True))
 
         self.use_liger = params.use_liger
-        if params.use_liger: 
+        if params.use_liger:
             self.norm = LigerRMSNorm(params.dim, eps=params.norm_eps)
-            self.ce = LigerCrossEntropyLoss(
-                reduction='mean',
-                ignore_index=-1
-            )
-            self.ce_sum = LigerCrossEntropyLoss(
-                reduction='sum',
-                ignore_index=-1
-            )
+            # Temporarily disable Liger cross entropy due to compatibility issues
+            self.ce = None
+            self.ce_sum = None
         else:
             self.norm = RMSNorm(params.dim, eps=params.norm_eps)
 
@@ -516,7 +438,7 @@ class LatentThoughtModel(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(h)
-            if self.use_liger:
+            if self.use_liger and self.ce is not None:
                 self.last_loss = self.ce(logits.view(-1, logits.size(-1)), targets.view(-1))
             else:
                 self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
@@ -654,7 +576,7 @@ class LatentThoughtModel(nn.Module):
         h, h_before_cross_attention = self.decoder_forward_with_hidden(tokens, z, targets, h_before_cross_attention)
         logits = self.output(h)
 
-        if not eval_mode and self.use_liger: # use liger only in training
+        if not eval_mode and self.use_liger and self.ce_sum is not None: # use liger only in training
             nlkhd = self.ce_sum(logits.view(-1, logits.size(-1)), targets.view(-1))
         else:
             nlkhd = F.cross_entropy(

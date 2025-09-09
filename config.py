@@ -25,9 +25,9 @@ DATASET_NAME = "openwebtext"  # Name of the dataset to use
 DATASET_AUTO_DOWNLOAD = True  # Whether to automatically download dataset if missing
 DATASET_NUM_SAMPLES = None  # Number of samples to download (None for all)
 DATASET_TOKENIZER = "gpt2"  # Tokenizer to use for preprocessing
-DATASET_NUM_WORKERS = 4  # Number of workers for parallel processing
-batch_size = 64  # Micro-batch size (before gradient accumulation)
-max_seq_len = 1024  # Maximum sequence length (context window)
+DATASET_NUM_WORKERS = 1  # Reduced to prevent memory issues with IterableDataset
+batch_size = 4  # Further reduced to prevent CUDA out of memory
+max_seq_len = 128  # Further reduced sequence length to save memory
 vocab_size = 50258  # Vocabulary size
 
 # -----------------------------------------------------------------------------
@@ -50,14 +50,14 @@ rwkv_mode = "rwkv8"  # RWKV mode: "rwkv7" or "rwkv8"
 # -----------------------------------------------------------------------------
 # Latent variable configuration
 # -----------------------------------------------------------------------------
-num_steps = 16  # Number of steps for posterior inference
+num_steps = 8  # Reduced number of steps for posterior inference to save memory
 inference_method = 'adamVI'  # Method used for posterior inference
 initial_fast_lr = 0.3  # Initial learning rate for latent optimization
 final_fast_lr = 0.34  # Final learning rate for latent optimization
 fast_lr = 0.34  # Current learning rate for latent optimization
 n_prior_layers = 0  # Number of layers in the prior network
 n_cls_tokens = 0  # Number of classification tokens
-max_z_len = n_layers * 8  # Maximum length of latent sequence
+max_z_len = n_layers * 4  # Reduced maximum length of latent sequence
 z_dim = dim  # Dimension of latent variables
 
 # DiT prior configuration
@@ -84,7 +84,7 @@ simcse_weight = 0.1  # Weight for SimCSE loss in total loss
 # -----------------------------------------------------------------------------
 # Optimizer settings
 # -----------------------------------------------------------------------------
-gradient_accumulation_steps = 8  # Number of steps to accumulate gradients (simulates larger batch)
+gradient_accumulation_steps = 4  # Reduced steps to save memory
 learning_rate = 4e-4  # Maximum learning rate for model training
 max_iters = 60000  # Total number of training iterations (~30B tokens)
 weight_decay = 1e-1  # L2 regularization
@@ -120,10 +120,10 @@ def get_config_dict():
 # OPTIMIZATION SETTINGS
 # -----------------------------------------------------------------------------
 # Enable multi-threaded data loading
-num_workers = 8  # Number of data loading workers (was 0)
+num_workers = 0  # DISABLED: Workers cause memory issues, using single process
 
 # Enable gradient checkpointing for memory efficiency
-gradient_checkpointing = True  # Enable gradient checkpointing
+gradient_checkpointing = False  # DISABLED: Gradient checkpointing saves memory but slows training
 
 # Enable optimized RWKV processing
 use_optimized_rwkv = True  # Use optimized RWKV attention
@@ -135,7 +135,7 @@ use_flash_attention = True  # Use Flash Attention kernels
 memory_optimization = True  # Enable memory optimization features
 
 # Enable KV caching for generation
-use_kv_cache = True  # Use KV cache for faster generation
+use_kv_cache = False  # DISABLED: KV cache saves memory during generation
 
 # Enable efficient DiT sampling
 use_efficient_dit_sampling = True  # Use efficient DiT sampling
@@ -154,4 +154,4 @@ memory_efficient_attention = True  # Use memory efficient attention
 gradient_checkpointing_interval = 1  # Apply checkpointing every N layers
 
 # Enable torch.compile for performance
-compile = True  # Enable PyTorch 2.0 compilation
+compile = False  # Disable PyTorch 2.0 compilation to save memory

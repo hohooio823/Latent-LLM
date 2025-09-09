@@ -100,7 +100,13 @@ class PosteriorOptimizer:
             
             # Generate DiT timesteps if using DiT prior
             if self.use_dit_prior:
-                timesteps = torch.randint(0, self.model.dit_prior.config.num_timesteps, (_bsz,), device=X.device)
+                if hasattr(self.model, 'dit_prior') and self.model.dit_prior is not None:
+                    timesteps = torch.randint(0, self.model.dit_prior.config.num_timesteps, (_bsz,), device=X.device)
+                else:
+                    # Fallback to Gaussian prior if DiT prior is not available
+                    print("Warning: DiT prior not available, falling back to Gaussian prior")
+                    self.use_dit_prior = False
+                    timesteps = None
             else:
                 timesteps = None
 
@@ -115,7 +121,7 @@ class PosteriorOptimizer:
         h = None
         e = torch.randn_like(log_var)  # Random noise for reparameterization trick
 
-        # Optimization loop
+        # Optimization loop with memory optimizations
         for s in range(num_steps):
             current_fast_lr = self.get_fast_lr(s)
             for param_group in optimizer.param_groups:
@@ -137,6 +143,11 @@ class PosteriorOptimizer:
             if h is not None:
                 h = h.detach()
                 h = None
+            
+            # Memory cleanup during optimization
+            if s % 4 == 0:  # Clean up every 4 steps
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
         
         # After optimization, sample final latent variables
         with torch.no_grad():
