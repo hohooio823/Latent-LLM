@@ -17,6 +17,11 @@ from model import LatentThoughtModel, LTMConfig
 from optimizer import PosteriorOptimizer
 from owt import Task
 from simcse_integration import create_simcse_integration, SentenceSimilarityEvaluator
+from auto_batch_size import auto_adjust_batch_size
+
+# Before training, auto-detect optimal batch size:
+if config.auto_batch_size:  # Add this flag to config
+    config = auto_adjust_batch_size(config)
 
 # Memory optimization utilities
 def optimize_memory_usage():
@@ -208,7 +213,7 @@ def main():
         n_prior_layers=config.n_prior_layers,
         n_cls_tokens=config.n_cls_tokens,
         window_size=config.window_size,
-        use_liger=True,  # Enable LIGER (Learned Implicit Generator) mode
+        use_liger=config.use_liger,
         max_z_len=config.max_z_len,
         use_z_pos_emb=True,  # Use positional embeddings for latent variables
         use_rwkv=config.use_rwkv,  # Use RWKV instead of transformer

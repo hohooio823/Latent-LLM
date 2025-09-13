@@ -4,15 +4,13 @@ from torch.utils.checkpoint import checkpoint
 from typing import Optional
 
 # Conditional import: optimized vs baseline attention
-try:
-    from config import use_optimized_rwkv as _use_opt_rwkv  # bool
-except Exception:
-    _use_opt_rwkv = False
 
-if _use_opt_rwkv:
-    from rwkv_attention_optimized import RWKVAttentionOptimized as RWKVAttention
-else:
+try:
+    from rwkv_attention_fla import RWKVAttention
+    print("✅ Using FLA-optimized RWKV (parallel)")
+except ImportError:
     from rwkv_attention import RWKVAttention
+    print("⚠️ Using original RWKV (sequential)")
 from rwkv_ffn import RWKVFeedForward, RWKV8FeedForward
 
 class RWKVBlock(nn.Module):

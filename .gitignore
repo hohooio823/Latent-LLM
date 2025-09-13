@@ -5,3 +5,4 @@ wandb/
 output/
 logs/
 *.log
+data_owt/

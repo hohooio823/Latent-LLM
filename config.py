@@ -154,4 +154,7 @@ memory_efficient_attention = True  # Use memory efficient attention
 gradient_checkpointing_interval = 1  # Apply checkpointing every N layers
 
 # Enable torch.compile for performance
-compile = False  # Disable PyTorch 2.0 compilation to save memory
+compile = True
+auto_batch_size = True
+use_liger = True
+use_z_pos_emb = True
