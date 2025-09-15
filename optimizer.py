@@ -92,7 +92,8 @@ class PosteriorOptimizer:
                 mu = torch.zeros(_bsz, max_z_len, z_dim, device=X.device)
                 log_var = (torch.randn_like(mu) * 0.1 - 5.0) if not const_var else (torch.zeros_like(mu) - 5.0)
             else:
-                mu = Z.clone() if persistent_init else torch.zeros_like(Z)
+                # Use last Z for warm initialization instead of random init
+                mu = Z.clone() if persistent_init else Z.detach().clone()
                 log_var = (torch.randn_like(mu) * 0.1 - 5.0) if not const_var else (torch.zeros_like(mu) - 5.0)
 
             mu = mu.view(_bsz, max_z_len, z_dim)
