@@ -554,53 +554,84 @@ class LatentThoughtModel(nn.Module):
         eps: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         h_before_cross_attention: Optional[torch.Tensor] = None,
-        eval_mode: bool = False,  # Whether to compute perplexity
+        eval_mode: bool = False,
         dit_timesteps: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
 
         _bsz, seqlen = tokens.shape
-        weight = 1.0
 
-        # Compute KL divergence
-        if self.use_dit_prior and dit_timesteps is not None:
-            # Use DiT prior for KL computation
-            kl_loss = self.compute_dit_kl_loss(mu, log_var, dit_timesteps)
+        # KL annealing (0 -> 1 over first 10k training steps)
+        if not hasattr(self, "training_step_count"):
+            self.register_buffer("training_step_count", torch.tensor(0))
+        if self.training:
+            self.training_step_count += 1
+            weight = min(1.0, self.training_step_count.item() / 10000.0)
         else:
-            # Use standard Gaussian prior
-            kl_div = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())  # -KL(q|p)
-            kl_loss = kl_div.sum(dim=(1, 2))  # Sum over latent dims, shape = (batch_size,)
+            weight = 1.0
 
-        # sample z by reparametrization trick
+        # Compute KL (Gaussian prior by default, or DiT if enabled with timesteps)
+        if getattr(self, "use_dit_prior", False) and dit_timesteps is not None:
+            kl_loss = self.compute_dit_kl_loss(mu, log_var, dit_timesteps)
+            # kl_loss here is a scalar if reduction='sum' inside compute_dit_kl_loss
+            # Make it per-sample compatible if needed
+            if kl_loss.dim() == 0:
+                kl_loss = kl_loss.unsqueeze(0).repeat(_bsz)  # broadcast to batch for consistency
+        else:
+            kl_div = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())  # -KL(q||p)
+            kl_loss = kl_div.sum(dim=(1, 2))  # per-sample KL (sum over latent dims)
+
+        # Reparameterization
         z = mu + eps * torch.exp(0.5 * log_var)
 
-        h, h_before_cross_attention = self.decoder_forward_with_hidden(tokens, z, targets, h_before_cross_attention)
+        # Forward through decoder (returns hidden + optional pre-cross-attn h)
+        h, h_before_cross_attention = self.decoder_forward_with_hidden(
+            tokens, z, targets, h_before_cross_attention
+        )
         logits = self.output(h)
 
-        if not eval_mode and self.use_liger and self.ce_sum is not None: # use liger only in training
-            nlkhd = self.ce_sum(logits.view(-1, logits.size(-1)), targets.view(-1))
+        # NLL
+        if not eval_mode and getattr(self, "use_liger", False) and getattr(self, "ce_sum", None) is not None:
+            nlkhd = self.ce_sum(logits.view(-1, logits.size(-1)), targets.view(-1))  # summed scalar
         else:
             nlkhd = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction="none"
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction="none",
             )
-        
-        if eval_mode: 
-            nlkhd = nlkhd.view(_bsz, -1).sum(dim=-1)  # Sum over sequence length, keep batch dim
-            nelbo_per_sample = nlkhd + kl_loss * weight
-            perplexity = torch.exp(nelbo_per_sample / seqlen)                
-            perplexity = perplexity.mean()  # Average perplexity over batch
 
-            nelbo = nelbo_per_sample.sum()  # Sum over batch
+        if eval_mode:
+            # Per-sample NLL (sum over seq), then perplexity on ELBO/token
+            nlkhd = nlkhd.view(_bsz, -1).sum(dim=-1)
+            nelbo_per_sample = nlkhd + kl_loss * weight
+            perplexity = torch.exp(nelbo_per_sample / seqlen)
+            perplexity = perplexity.mean()
+            nelbo = nelbo_per_sample.sum()
             kl_mean = kl_loss.mean()
             nlkhd_mean = nlkhd.mean()
-            return nelbo, perplexity, h_before_cross_attention.detach() if h_before_cross_attention is not None else None, kl_mean, nlkhd_mean
-
-        else: # training
-            nlkhd_total = nlkhd.sum()
-            kl_loss_total = kl_loss.sum()
-            nelbo_total = nlkhd_total + kl_loss_total * weight
+            return (
+                nelbo,
+                perplexity,
+                h_before_cross_attention.detach() if h_before_cross_attention is not None else None,
+                kl_mean,
+                nlkhd_mean,
+            )
+        else:
+            # Training: use per-sample mean loss to preserve sample-wise gradients
+            if nlkhd.dim() > 0:
+                nlkhd = nlkhd.view(_bsz, -1).sum(dim=-1)  # per-sample NLL
+            nelbo_per_sample = nlkhd + kl_loss * weight
+            nelbo = nelbo_per_sample.mean()
+            kl_mean = kl_loss.mean()
+            nlkhd_mean = nlkhd.mean()
             perplexity = None
-            return nelbo_total, perplexity, h_before_cross_attention.detach() if h_before_cross_attention is not None else None, kl_loss_total, nlkhd_total
-    
+            return (
+                nelbo,
+                perplexity,
+                h_before_cross_attention.detach() if h_before_cross_attention is not None else None,
+                kl_mean,
+                nlkhd_mean,
+            )
     def compute_dit_kl_loss(self, mu: torch.Tensor, log_var: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Compute KL divergence using DiT prior."""
         B, TZ, D = mu.shape

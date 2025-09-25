@@ -99,8 +99,20 @@ class RWKVAttention(nn.Module):
         
         B, T, C = x.shape
         
-        # RWKV time mixing (matching original exactly)
-        xx = torch.cat([x[:, 1:2, :], x[:, :-1, :]], dim=1) - x
+        # --- FIX for T=1 Generation Bug ---
+        # The original time-mixing logic fails when T=1 because slices like x[:, :-1] become empty.
+        # For the first token, the difference from the "previous" token is zero.
+        if T > 1:
+            # A robust way to compute x_{t} - x_{t-1}
+            # Prepend the first token to create a correctly shifted tensor for subtraction
+            shifted_x = torch.cat([x[:, :1, :], x[:, :-1, :]], dim=1)
+            xx = x - shifted_x
+        else:
+            # If T=1, there's no previous token, so the difference is zero.
+            xx = torch.zeros_like(x)
+        # --- End of Fix ---
+
+        # RWKV time mixing (using the corrected 'xx' from above)
         xk = x + xx * self.time_mix_k
         xv = x + xx * self.time_mix_v
         xr = x + xx * self.time_mix_r
@@ -132,7 +144,8 @@ class RWKVAttention(nn.Module):
             
             # Time mixing for z
             if T_z > 1:
-                zz = torch.cat([z[:, :1, :], z[:, :-1, :]], dim=1) - z
+                shifted_z = torch.cat([z[:, :1, :], z[:, :-1, :]], dim=1)
+                zz = z - shifted_z
             else:
                 zz = torch.zeros_like(z)
             
@@ -168,22 +181,12 @@ class RWKVAttention(nn.Module):
             try:
                 # FLA returns (output, final_state) tuple
                 result = fused_recurrent_rwkv6(
-                    r.float(),
-                    k.float(),
-                    v.float(),
-                    w.float(),
-                    self.time_first.float(),
-                    scale=1.0,
-                    initial_state=None,
+                    r.float(), k.float(), v.float(), w.float(),
+                    self.time_first.float(), scale=1.0, initial_state=None,
                     output_final_state=True
                 )
                 
-                # Handle tuple return from FLA
-                if isinstance(result, tuple):
-                    attn_output = result[0]
-                else:
-                    attn_output = result
-                    
+                attn_output = result[0] if isinstance(result, tuple) else result
                 attn_output = attn_output.to(x.dtype)
                 
             except Exception as e:
@@ -224,11 +227,6 @@ class RWKVAttention(nn.Module):
         output = torch.matmul(attn, v)
         
         return output
-    
-    def _rwkv_attention_parallel(self, r, k, v, w, T):
-        """Compatibility alias"""
-        return self._rwkv_attention_parallel_fallback(r, k, v, w, T)
-
 
 # Create aliases for compatibility
 RWKVAttentionOptimized = RWKVAttention

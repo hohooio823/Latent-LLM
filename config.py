@@ -10,7 +10,7 @@ from datetime import datetime
 # -----------------------------------------------------------------------------
 timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 out_dir = f"output/ltm_gpt2scale_{timestamp}"
-eval_interval = 1000
+eval_interval = 500
 log_interval = 10
 eval_iters = 200
 always_save_checkpoint = True
@@ -49,11 +49,11 @@ rwkv_mode = "rwkv8"
 # -----------------------------------------------------------------------------
 # Latent variable configuration - ENHANCED FOR LONGER CONTEXT
 # -----------------------------------------------------------------------------
-num_steps = 8  # Your latent optimization steps
+num_steps = 16  # Your latent optimization steps
 inference_method = 'adamVI'
 initial_fast_lr = 0.3
 final_fast_lr = 0.34
-fast_lr = 0.34
+fast_lr = 0.3
 n_prior_layers = 6  # Fixed from 0 to match your DiT
 n_cls_tokens = 0
 max_z_len = 192  # Increased for 1024 context (was 48 for 128)
@@ -85,7 +85,7 @@ simcse_weight = 0.1
 # -----------------------------------------------------------------------------
 gradient_accumulation_steps = 64  # 2 * 64 = 128 effective batch
 learning_rate = 6e-4  # GPT-2 learning rate
-max_iters = 600000  # GPT-2 scale training
+max_iters = 60000  # GPT-2 scale training
 weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.95

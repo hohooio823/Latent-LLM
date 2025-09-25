@@ -6,9 +6,8 @@ for transformer-based language models using variational inference.
 """
 
 import torch
-import time
 import math
-from typing import List, Tuple, Dict, Optional, Any, Union
+from typing import List, Tuple, Optional
 
 
 class PosteriorOptimizer:
@@ -19,48 +18,61 @@ class PosteriorOptimizer:
         self.use_dit_prior = kwargs.get("use_dit_prior", False)
         print("Optimizer kwargs", self.kwargs)
 
-    def step(self, data: List, ctx, scaler: Optional[torch.cuda.amp.GradScaler] = None, 
-             steps: Optional[int] = None, seed: Optional[int] = None, lr: Optional[float] = None) -> Tuple:
-        return self._adamVI(data, ctx, scaler, steps, seed=seed, lr=lr)
+    def step(
+        self,
+        data: List,
+        ctx,
+        scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        steps: Optional[int] = None,
+        seed: Optional[int] = None,
+        lr: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Runs one VI solve for a batch, returns (z, ppl, kl, nlkhd).
+        Restores model mode (train/eval) based on how this optimizer was constructed.
+        """
+        result = self._adamVI(data, ctx, scaler, steps, seed=seed, lr=lr)
+
+        # Restore mode based on eval_mode flag configured for this optimizer
+        if self.kwargs.get("eval_mode", True):
+            self.model.eval()
+        else:
+            self.model.train()
+        return result
 
     def get_fast_lr(self, it: int) -> float:
         """
-        Calculate learning rate based on iteration using cosine decay.
+        Paper specifies linear increase from 0.3 to 0.34 over the fast steps.
         """
-        fast_lr = self.kwargs.get("lr", 1e-1)
-        min_fast_lr = fast_lr / 10
-        num_steps = self.kwargs.get("num_steps", 10)
-        fast_lr_decay_steps = num_steps
-        
-        # Cosine decay from learning_rate to min_lr over lr_decay_iters steps
-        if it < fast_lr_decay_steps:
-            decay_ratio = it / fast_lr_decay_steps
-            assert 0 <= decay_ratio <= 1
-            coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges from 1 to 0
-            return min_fast_lr + coeff * (fast_lr - min_fast_lr)
-        
-        # After lr_decay_iters, return min learning rate
-        return min_fast_lr
-    
-    def _adamVI(self, data: List, ctx, scaler: Optional[torch.cuda.amp.GradScaler], 
-                steps: Optional[int] = None, seed: Optional[int] = None, lr: Optional[float] = None) -> Tuple:
+        start_lr = 0.3
+        end_lr = 0.34
+        num_steps = self.kwargs.get("num_steps", 16)
+        if it < num_steps:
+            return start_lr + (end_lr - start_lr) * it / num_steps
+        return end_lr
+
+    def _adamVI(
+        self,
+        data: List,
+        ctx,
+        scaler: Optional[torch.cuda.amp.GradScaler],
+        steps: Optional[int] = None,
+        seed: Optional[int] = None,
+        lr: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Optimize latent variables using Adam optimizer and variational inference.
-        
+
         Args:
-            data: List containing [X, Y, Z] tensors (input, target, latent)
-            ctx: Context manager for mixed precision training
-            scaler: GradScaler for mixed precision training
-            steps: Number of optimization steps (overrides kwargs)
-            seed: Random seed for reproducibility
-            lr: Learning rate (overrides kwargs)
-            
+            data: [X, Y, Z] tensors (input, target, prior latent guess)
+            ctx: autocast context
+            scaler: AMP scaler
+            steps: number of Adam steps for VI
+            seed: optional seed
+            lr: optional base lr (unused since we overwrite with get_fast_lr inside loop)
+
         Returns:
-            Tuple containing:
-            - z: Optimized latent variables
-            - ppl: Perplexity
-            - kl_loss: KL divergence loss
-            - nlkhd: Negative log likelihood
+            (z, ppl, kl_loss, nlkhd)
         """
         # Get optimization parameters from kwargs with defaults
         lr = lr if lr is not None else self.kwargs.get("lr", 1e-1)
@@ -71,67 +83,78 @@ class PosteriorOptimizer:
         max_z_len = self.kwargs.get("max_z_len", 1)
         z_dim = self.kwargs.get("z_dim", 288)
         const_var = self.kwargs.get("const_var", False)
-        reduce = self.kwargs.get("reduce", True)
         eval_mode = self.kwargs.get("eval_mode", True)
-        
-        # Set random seed for reproducibility if provided
+
+        # Optional seed
         if seed is not None:
             torch.manual_seed(seed)
-            torch.cuda.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
 
-        # Set model to evaluation mode during optimization
+        # VI is computed with model in eval() to stabilize numerics
         self.model.eval()
 
         # Unpack input data
         X, Y, Z = data
         _bsz = X.shape[0]
 
-        # Initialize latent variable parameters
+        # Initialize latent parameters: cold-start for training, warm-start only in eval
         with torch.no_grad():
-            if Z is None:
-                mu = torch.zeros(_bsz, max_z_len, z_dim, device=X.device)
-                log_var = (torch.randn_like(mu) * 0.1 - 5.0) if not const_var else (torch.zeros_like(mu) - 5.0)
-            else:
-                # Use last Z for warm initialization instead of random init
-                mu = Z.clone() if persistent_init else Z.detach().clone()
-                log_var = (torch.randn_like(mu) * 0.1 - 5.0) if not const_var else (torch.zeros_like(mu) - 5.0)
+            mu = torch.zeros(_bsz, max_z_len, z_dim, device=X.device)
+            log_var = torch.ones_like(mu) * -5.0  # small variance start
+
+            if eval_mode and Z is not None and persistent_init:
+                # Only warm-start during evaluation
+                mu = Z.clone()
 
             mu = mu.view(_bsz, max_z_len, z_dim)
             log_var = log_var.view(_bsz, max_z_len, z_dim)
-            
-            # Generate DiT timesteps if using DiT prior
+
+            # Optional DiT prior timesteps
             if self.use_dit_prior:
-                if hasattr(self.model, 'dit_prior') and self.model.dit_prior is not None:
-                    timesteps = torch.randint(0, self.model.dit_prior.config.num_timesteps, (_bsz,), device=X.device)
+                if hasattr(self.model, "dit_prior") and self.model.dit_prior is not None:
+                    timesteps = torch.randint(
+                        0, self.model.dit_prior.config.num_timesteps, (_bsz,), device=X.device
+                    )
                 else:
-                    # Fallback to Gaussian prior if DiT prior is not available
                     print("Warning: DiT prior not available, falling back to Gaussian prior")
                     self.use_dit_prior = False
                     timesteps = None
             else:
                 timesteps = None
 
-        # Set up parameters for optimization
+        # Parameters to optimize
         mu.requires_grad_()
         if not const_var:
             log_var.requires_grad_()
 
         optimizer = torch.optim.AdamW([mu, log_var], lr=lr, betas=betas, eps=eps)
-        
-        # Initialize hidden state and random noise for reparameterization
-        h = None
-        e = torch.randn_like(log_var)  # Random noise for reparameterization trick
 
-        # Optimization loop with memory optimizations
+        # Noise for reparameterization
+        h = None
+        e = torch.randn_like(log_var)
+
+        # Optional debug: KL before/after
+        do_log = torch.rand(1).item() < 0.01
+        if do_log:
+            with torch.no_grad():
+                kl_before = (
+                    -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())
+                ).sum(dim=(1, 2)).mean().item()
+            print(f"[VI] KL before optimization: {kl_before:.1f}")
+
+        # VI loop
         for s in range(num_steps):
             current_fast_lr = self.get_fast_lr(s)
             for param_group in optimizer.param_groups:
-                param_group['lr'] = current_fast_lr
-                
-            optimizer.zero_grad(set_to_none=True)  # More memory-efficient than False
+                param_group["lr"] = current_fast_lr
+
+            optimizer.zero_grad(set_to_none=True)
             with ctx:
-                loss, _, h, _, _ = self.model.elbo(X, mu, log_var, e, Y, h, eval_mode=eval_mode, dit_timesteps=timesteps)
-        
+                loss, _, h, _, _ = self.model.elbo(
+                    X, mu, log_var, e, Y, h, eval_mode=eval_mode, dit_timesteps=timesteps
+                )
+
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -140,28 +163,36 @@ class PosteriorOptimizer:
                 loss.backward()
                 optimizer.step()
 
-            # Clear hidden state between iterations to prevent memory buildup
             if h is not None:
                 h = h.detach()
-                h = None
-            
-            # Memory cleanup during optimization
-            if s % 4 == 0:  # Clean up every 4 steps
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-        
-        # After optimization, sample final latent variables
+
+            # Occasional cleanup
+            if s % 4 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+        if do_log:
+            with torch.no_grad():
+                kl_after = (
+                    -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())
+                ).sum(dim=(1, 2)).mean().item()
+            print(f"[VI] KL after optimization:  {kl_after:.1f}")
+
+        # Final z sample
         with torch.no_grad():
             std = torch.exp(0.5 * log_var)
-            if const_var: 
-                z = mu  # Just use mean if variance is constant
-                log_var = torch.zeros_like(log_var) - 5.0  # Reset log_var
+            if const_var:
+                z = mu
+                log_var = torch.zeros_like(log_var) - 5.0
             else:
-                z = mu + e * std  # Sample using reparameterization trick
+                z = mu + e * std
 
-        # Compute final metrics
-        with ctx:
-            loss, ppl, h, kl_loss, nlkhd = self.model.elbo(X, mu, log_var, e, Y, h, eval_mode=True, dit_timesteps=timesteps)
+        # Final metrics (no graph)
+        with torch.no_grad():
+            with ctx:
+                _, ppl, h, kl_loss, nlkhd = self.model.elbo(
+                    X, mu, log_var, e, Y, h, eval_mode=True, dit_timesteps=timesteps
+                )
 
-        # Return optimized latent variables and metrics
         return z.detach(), ppl.detach(), kl_loss.detach(), nlkhd.detach()
